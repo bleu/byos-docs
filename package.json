@@ -1,0 +1,19 @@
+{
+  "name": "byos-docs",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared specification for the BYOS project (bleu/byos-contracts, bleu/byos-service, bleu/byos-service-ts)",
+  "scripts": {
+    "dev": "npm run llms && vitepress dev",
+    "build": "npm run llms && vitepress build",
+    "preview": "vitepress preview",
+    "llms": "tsx scripts/gen-llms.ts"
+  },
+  "devDependencies": {
+    "mermaid": "^11.4.1",
+    "tsx": "^4.19.2",
+    "vitepress": "^1.6.3",
+    "vitepress-plugin-mermaid": "^2.0.17"
+  }
+}
