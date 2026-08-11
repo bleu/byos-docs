@@ -6,6 +6,27 @@ This guide is about sequence and gotchas. Every normative fact — field names, 
 
 You do not need a CoW solver seat, an allowlist entry, or a relationship with the CoW DAO. You need an address, collateral in the escrow, and the ability to sign EIP-712 messages and quote a route.
 
+## Your role as a sub-solver
+
+Understanding what you are and are not responsible for will save you time.
+
+**You are responsible for:**
+
+- **Depositing collateral** into the Escrow. The deposit is the permission — there is no allowlist. Your balance must cover at least one worst-case Track A debit (`gas + c_l`).
+- **Finding routable orders** in CoW's public orderbook and computing routes using any DEX or protocol.
+- **Building complete routes**, including any pre- and post-hooks the order's app data requires. BYOS will reject proposals that omit required hooks, but passing that check does not transfer liability.
+- **Sizing your `buyAmount` floor.** This is a margin call you make: too thin and your route reverts on-chain (Track A debit), too thick and you lose auctions.
+- **Setting your own venue-level fees.** If your route goes through a pool you operate, you keep those fees. If you want to capture surplus above your floor, do it inside your route before the sweep.
+- **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade.
+
+**You are NOT responsible for:**
+
+- **Transaction submission.** BYOS builds and submits the settlement through the CoW driver. You never call `settle`.
+- **Scoring or auction bidding.** BYOS scores proposals (`surplus - gas`), selects the best one per order, and bids it into CoW's competition.
+- **Gas estimation or fee calculation.** BYOS sizes the gas cut and the driver applies protocol/partner fees. Your amounts are raw, pre-fee route amounts.
+- **Trampoline contract logic.** The sweep, the floor enforcement, and the sandbox isolation are contract code you cannot override.
+- **CoW protocol compliance.** BYOS handles the relationship with the CoW DAO, the bonding pool, and the reward accounting. However, gatekeeping is non-exculpatory — your signed route is your responsibility.
+
 ## 1. What you are signing up for
 
 You compute routes. BYOS bids them into CoW's auction under its own bonded solver seat, submits the settlement, and takes the consequences from the protocol. When a settlement carrying your route fails on-chain, BYOS charges that cost back to your escrow balance. **This is real money, debited without asking you first**, on the terms in [`#penalties`](../design-document#penalties).
@@ -70,6 +91,22 @@ Keep `validUntil` short. It is capped at ingestion ([`#proposal-lifecycle`](../d
 
 `POST` the proposal. Endpoints, payload shape, status codes, and typed rejection reasons are in the [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml).
 
+### API endpoint summary
+
+All endpoints on the public listener (default port 9585):
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `202` with an id — **not** acceptance. |
+| `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Fetch your proposal's status, rejection reason, settlement/penalty tx hashes. |
+| `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on a specific order. |
+| `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. |
+| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Only works on `Submitted` or `Active` proposals. |
+
+Read authentication uses a bearer-style EIP-712 signature over `ReadAuth { version: 1 }`. Sign it once and send it on every `GET` request via the `X-Signature` header. It carries no timestamp or nonce — the blast radius of a leak is read access to your own proposals only, no writes, no cancellation.
+
+Non-owners always get `404` — not `403` — so you cannot probe whether a proposal id exists.
+
 **A `2xx` is not acceptance.** It means "accepted for validation" and hands you an id. Escrow checks and simulation run in a background loop, not on the request path ([`#proposal-api`](../design-document#proposal-api)). Integration code that treats a `2xx` as "my proposal is live" is wrong.
 
 Poll for the verdict. Reads are signature-gated and scoped to you — you sign a long-lived read token once and send it on every request, and you cannot see anyone else's proposals on an order, not even the fact that they exist. A proposal that is not yours returns 404 rather than 403, so do not read a 404 as "deleted".
@@ -100,11 +137,16 @@ Track B is the one that needs operational readiness. Claims can arrive up to thr
 
 Every penalty action emits an on-chain Escrow event. That is the public record, and it is enough for you to audit your own history without trusting BYOS's private accounting.
 
-## 8. A worked example
+## 8. Reference implementations
 
-The reference sub-solver in [`crates/subsolver`](https://github.com/bleu/byos-service/tree/main/crates/subsolver) is a working client and the counterpart in the end-to-end test suite. It does the whole loop: fetch orders, quote a baseline route, sign, submit, poll, resubmit.
+Two baseline sub-solver examples exist, one per service implementation. Both do the full loop: fetch orders from CoW's orderbook, quote a Uniswap V2 route, sign an EIP-712 proposal, submit, poll for verdict, resubmit.
 
-It is Rust, but the protocol is language-neutral — what you want from it is the sequence, the EIP-712 construction, and the polling behaviour. Everything it does over the wire is specified in the OpenAPI document.
+| Language | Location | Notes |
+|---|---|---|
+| **Rust** | [`crates/subsolver`](https://github.com/bleu/byos-service/tree/main/crates/subsolver) in `byos-service` | Counterpart in the Rust service's end-to-end test suite |
+| **TypeScript** | [`apps/subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/subsolver) in `byos-service-ts` | Uses viem for EIP-712 signing, multicall for reserve fetching |
+
+The protocol is language-neutral — what you want from either example is the sequence, the EIP-712 construction, and the polling behavior. Everything they do over the wire is specified in the OpenAPI document.
 
 ## Checklist before you go live
 

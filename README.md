@@ -25,7 +25,9 @@ The local path is what agents, offline readers, and `grep` use, and it is pinned
 
 ## Where to start
 
-**Auditors** — [the design document](design-document.md), top to bottom. It is normative: where an implementation disagrees with it, the implementation is wrong, unless the document carries a dated revision note saying otherwise. The status table at the top says what is built today. The adversarial isolation proof is in [trampoline / settlement isolation](security/trampoline-settlement-isolation.md).
+**New to BYOS?** — [What is BYOS](overview.md). The problem it solves, how it works at a high level, what sub-solvers get and don't get, why proposals get discarded, and the slashing policy.
+
+**Auditors** — [the design document](design-document.md), top to bottom. It is normative: where an implementation disagrees with it, the implementation is wrong, unless the document carries a dated revision note saying otherwise. The status table at the top says what is built today. The adversarial isolation proof is in [trampoline / settlement isolation](security/trampoline-settlement-isolation.md). The [contracts reference](contracts.md) and [service architecture](service.md) pages consolidate interfaces, interactions, and design decisions from the implementation repos.
 
 **Sub-solvers** — [the integration guide](guides/sub-solver-integration.md). It is the path from zero to a settled proposal, and it links into the design document for anything normative.
 
