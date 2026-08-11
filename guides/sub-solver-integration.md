@@ -8,8 +8,6 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with th
 
 ## Your role as a sub-solver
 
-Understanding what you are and are not responsible for will save you time.
-
 **You are responsible for:**
 
 - **Depositing collateral** into the Escrow. The deposit is the permission — there is no allowlist. Your balance must cover at least one worst-case Track A debit (`gas + c_l`).

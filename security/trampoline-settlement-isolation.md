@@ -16,12 +16,10 @@ settlement ([`#residue`](../design-document#residue)), so the instance is empty 
 trade tokens at rest, and each sub-solver has a distinct instance. The blast radius of
 any route is the trade capital in flight during its own settlement.
 
-The tests demonstrate this against the **real deployed `GPv2Settlement`** on a mainnet
-fork, not a mock — the point is to exercise CoW's actual semantics (allowance checks,
-`onlySolver`, the reentrancy guard, owner-scoped order state), since a mock would only
-restate our own assumptions. A controlled ERC-20 buffer is seeded into the settlement in
-`setUp`, so every "no value moved" assertion runs against real, non-zero value rather
-than a vacuous zero-to-zero.
+The tests run against the **real deployed `GPv2Settlement`** on a mainnet fork, exercising
+CoW's actual semantics (allowance checks, `onlySolver`, the reentrancy guard,
+owner-scoped order state). A controlled ERC-20 buffer is seeded into the settlement in
+`setUp`, so every "no value moved" assertion runs against non-zero value.
 
 The invariant asserted is that value does not move — buffer balances, allowances, and
 order state are unchanged after the route runs. A revert is one mechanism that enforces

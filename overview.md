@@ -4,7 +4,7 @@ BYOS (Bring Your Own Solver) is a bonded CoW Protocol solver that opens CoW's or
 
 ## The problem BYOS solves
 
-Becoming a CoW solver today is a gated process designed for established market makers and trading firms:
+Becoming a CoW solver today is a gated process:
 
 | Requirement | Standard pool (CIP-7) | Reduced pool (CIP-44) |
 |---|---|---|
@@ -14,13 +14,13 @@ Becoming a CoW solver today is a gated process designed for established market m
 | Onboarding | Shadow competition and testing on Sepolia before mainnet access | Same requirement |
 | Compliance | KYC through the vouching solver's pool | Same |
 
-This makes sense for actors who submit directly to `GPv2Settlement` — the bond is the protocol's recourse against misbehavior. But it also means that a DEX aggregator, a routing API, or an independent quant who can find good routes has no way to participate without first finding a bonding pool willing to vouch for them and locking up significant capital.
+A DEX aggregator, a routing API, or an independent quant who can find good routes has no way to participate without first finding a bonding pool willing to vouch for them and locking up significant capital.
 
-**After BYOS**, the barrier drops to a collateral deposit of roughly 0.010 ETH (the minimum, sized to cover one worst-case revert penalty) and the ability to sign an EIP-712 message and return a route. No KYC, no vouching, no shadow competition, no bonding pool. The deposit *is* the permission.
+**After BYOS**, the barrier drops to a collateral deposit of roughly 0.010 ETH (the minimum, sized to cover one worst-case revert penalty) and the ability to sign an EIP-712 message and return a route.
 
 ## How it works
 
-BYOS sits between sub-solvers and the CoW auction as a single bonded solver. From the protocol's perspective, BYOS is ordinary — one solver, one bond, one seat in the competition. Internally, it sources its solutions from anyone willing to post collateral.
+BYOS sits between sub-solvers and the CoW auction as a single bonded solver. From the protocol's perspective it is an ordinary solver. Internally, it sources its solutions from anyone willing to post collateral.
 
 ```mermaid
 flowchart LR
@@ -56,7 +56,7 @@ The flow:
 3. **BYOS validates** each proposal in the background: checks escrow balance, simulates the full settlement via `eth_estimateGas`, and scores it (`surplus - gas`).
 4. **When the CoW driver calls `/solve`**, BYOS answers instantly from its pool of validated proposals — no RPC, no simulation on the hot path. It picks the highest-scoring proposal per order.
 5. **The driver settles** the winning solution on-chain. The sub-solver's route executes inside a per-sub-solver sandbox contract (the Trampoline), isolated from settlement buffers.
-6. **If the settlement reverts**, BYOS debits the sub-solver's escrow to cover the gas cost. If it succeeds, the trade lands and everyone is paid.
+6. **If the settlement reverts**, BYOS debits the sub-solver's escrow to cover the gas cost.
 
 ## What sub-solvers get and don't get
 
@@ -75,7 +75,7 @@ The flow:
 
 BYOS keeps the **gas cut** — the estimated gas cost of each settlement, denominated in the order's sell token. This is declared as a solver fee in the solution, and the difference stays in `GPv2Settlement`'s buffers. CoW's weekly accounting returns it to BYOS as the solver's network fee reimbursement.
 
-There is no percentage fee, no subscription, and no charge for failed proposals. Only settled trades generate revenue for BYOS.
+Only settled trades generate revenue.
 
 Additionally, BYOS retains all **CoW solver rewards** (CIP-20/CIP-85 performance and consistency rewards) earned under its bonded solver address. Reward pass-through to sub-solvers is out of scope for v1.
 
@@ -130,6 +130,6 @@ When a settlement carrying a sub-solver's route causes BYOS to incur a cost from
 
 Track B claims can arrive up to **three months** after the trade. If the sub-solver has already withdrawn or the escrow balance is insufficient, BYOS absorbs the difference.
 
-**Simulation failures are free.** Only on-chain failures touch escrow. A proposal that fails simulation is dropped with no penalty — these are usually environmental (a pool moved, the order filled elsewhere), and charging for them would deter permissionless participation.
+**Simulation failures are free.** Only on-chain failures touch escrow. A proposal that fails simulation is dropped with no penalty.
 
 For the full normative specification, see [the design document](design-document#penalties).

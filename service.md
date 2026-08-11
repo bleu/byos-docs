@@ -13,9 +13,7 @@ The service binds two ports on one process, with opposite trust boundaries:
 | **Public** | 9585 | `/proposals` (POST, GET, DELETE) | Internet-reachable, rate-limited |
 | **Internal** | 9586 | `/solve`, `/notify` | Firewalled, driver-only |
 
-They never share a socket. A `/solve` response contains the full standing proposal book for an auction — amounts, routes, and signatures, all MEV-relevant — so it must not be reachable from the public internet. An optional bearer token on `/solve` is defense in depth, not a replacement for network topology.
-
-The split also prevents public traffic from starving the latency-critical `/solve` path.
+They never share a socket. A `/solve` response contains the full standing proposal book for an auction — amounts, routes, and signatures, all MEV-relevant — so it must not be reachable from the public internet. An optional bearer token on `/solve` provides defense in depth.
 
 ## Request flow
 
@@ -79,7 +77,7 @@ Runs every ~12 seconds (one block), concurrency-bounded (8 concurrent RPC calls)
    - **Settlement simulation** (expensive): full `settle()` via `eth_estimateGas` with state overrides. Records gas used, trampoline address, and token addresses on success.
    - **Profitability gate** (first validation only): `score = surplus - gas > 0`. Not re-applied on re-validation to avoid gas-price flapping churn.
 
-A simulation revert is **terminal on first occurrence** — no strikes, no retries. Resubmission is the sub-solver's "I still believe in this route" signal.
+A simulation revert is **terminal on first occurrence** — no strikes, no retries.
 
 ### Penalty loop
 
@@ -170,9 +168,9 @@ Rationale for each decision lives in the ADRs of [byos-service](https://github.c
 
 ### Async ingestion
 
-The request path does only signature + expiry checks. Escrow and simulation validation run in the background. This decouples latency from RPC health, prevents DDoS from starving `/solve`, and avoids duplicating validation logic between the request path and the re-simulation loop.
+The request path does only signature + expiry checks. Escrow and simulation validation run in the background.
 
-A `2xx` from `POST /proposals` means "accepted for validation", not "accepted". Integration code that treats it as acceptance is wrong.
+A `2xx` from `POST /proposals` means "accepted for validation", not "accepted".
 
 ### No chain watcher
 
@@ -180,11 +178,11 @@ Settlement outcomes come from the stock CoW driver's `/notify` endpoint, not fro
 
 ### Owner-scoped reads
 
-All `GET` endpoints require an EIP-712 signature, and the recovered signer scopes the response. Competitors' proposals are invisible — even "which addresses are competing on which order" does not leak. Non-owners get `404`, not `403`, to prevent existence-oracle attacks.
+All `GET` endpoints require an EIP-712 signature, and the recovered signer scopes the response. Non-owners get `404`, not `403`, to prevent existence-oracle attacks.
 
 ### First-revert-terminal simulation
 
-A proposal that fails simulation once is not re-simulated. If it won and then reverted on-chain, the sub-solver would take a Track A penalty. Resubmission is the sub-solver's explicit signal that the route is still viable.
+A proposal that fails simulation once is not re-simulated.
 
 ### Profitability gate on first validation only
 
@@ -196,7 +194,7 @@ A score of zero or less rejects as `Unprofitable` on the first simulation, match
 
 ### One sub-solver per settlement transaction
 
-Clean, indisputable attribution. The per-sub-solver Trampoline CREATE2 address in the calldata self-evidences which sub-solver's route ran. The driver's `SolutionMerging` is set to `Forbidden` to prevent silent batching.
+The per-sub-solver Trampoline CREATE2 address in the calldata identifies which sub-solver's route ran. The driver's `SolutionMerging` is set to `Forbidden` to prevent silent batching.
 
 ### Compare-and-swap transitions
 

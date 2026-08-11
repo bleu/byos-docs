@@ -1,6 +1,6 @@
 # SLO targets
 
-Latency targets for the BYOS service, and the reasoning behind each number. These are commitments the service implementations are built against, so they belong here rather than in either service repo.
+Latency targets for the BYOS service, and the reasoning behind each number.
 
 ## `POST /solve` p99 < 100ms
 
@@ -8,7 +8,7 @@ The hot path, called by the CoW driver during auctions.
 
 The driver gives solvers a 15-second deadline, configurable via `solve_deadline` in the autopilot. BYOS does no simulation and no RPC on this path: an indexed read of the live proposal rows per auction order, one `solutions` insert per returned bid, and scoring and encoding in memory ([`#solver-engine`](../design-document#solver-engine)).
 
-100ms is conservative against a 15s deadline. The point is not to be fast, it is to guarantee BYOS is never the bottleneck in the auction cycle.
+100ms is conservative against a 15s deadline — BYOS should never be the bottleneck in the auction cycle.
 
 ## `GET /proposals/by-sub-solver` p99 < 50ms
 

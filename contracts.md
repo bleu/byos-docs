@@ -1,6 +1,6 @@
 # Contracts reference
 
-The on-chain component of BYOS: three contracts that hold collateral, sandbox route execution, and anchor EIP-712 proposal signatures. All are immutable — no proxies, no upgrade keys. A v2 means a new deployment; the cooldown-based withdrawal makes migration straightforward.
+The on-chain component of BYOS: three contracts that hold collateral, sandbox route execution, and anchor EIP-712 proposal signatures. All are immutable — no proxies, no upgrade keys. A v2 means a new deployment.
 
 The authoritative Solidity interfaces, NatSpec, and tests live in [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). This page is a reference summary; the [design document](design-document) is normative on semantics.
 
@@ -235,7 +235,7 @@ Rationale for each decision lives in the [ADRs in `byos-contracts`](https://gith
 
 ### One Trampoline instance per sub-solver
 
-Each sub-solver gets its own isolated sandbox at a deterministic CREATE2 address. This confines approvals and residue to the originating sub-solver, enables on-chain attribution (the CREATE2 address in calldata self-evidences who ran), and permits safe approval reuse across that sub-solver's settlements. A shared trampoline would require enumerating and resetting approvals per settlement — fragile across exotic token variants — and would make attribution ambiguous.
+Each sub-solver gets its own isolated sandbox at a deterministic CREATE2 address. This confines approvals and residue to the originating sub-solver, enables on-chain attribution (the CREATE2 address in calldata identifies who ran), and permits safe approval reuse across that sub-solver's settlements.
 
 ### ERC20 for escrow balance
 
@@ -267,7 +267,7 @@ Deploying the instance when escrow is deposited (not lazily during settlement) k
 
 ### Immutable contracts, no proxies
 
-Immutability is a trust signal for sub-solvers: the code they deposit into will not change. Migration to a v2 is a new deployment, and the cooldown-based withdrawal makes it straightforward. The factory redeployment invalidates all outstanding signatures, ensuring clean generation boundaries.
+No proxy, no upgrade key. A v2 is a new deployment. The factory redeployment invalidates all outstanding signatures.
 
 ### Single-order solutions
 
