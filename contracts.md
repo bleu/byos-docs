@@ -76,7 +76,7 @@ A compromised operator can grief (debit falsely, freeze, pause) but cannot steal
 |---|---|
 | `setCooldownPeriod(uint256 period)` | Updates the withdrawal cooldown. |
 | `grantRole / revokeRole` | Manage OPERATOR_ROLE and SUBMITTER_ROLE. |
-| `transferOwnership / acceptOwnership` | Two-step ownership transfer (prevents address typos from bricking the contract). |
+| `beginDefaultAdminTransfer / acceptDefaultAdminTransfer` | Two-step ownership transfer (prevents address typos from bricking the contract). |
 
 #### Views
 
@@ -197,6 +197,7 @@ These exist for intermediate-token dust and stray transfers. Trade tokens are sw
 | `Trampoline_InvalidSignature()` | Recovered signer is not `SUB_SOLVER`. |
 | `Trampoline_FloorNotMet(uint256 delta, uint256 floor)` | Route delivered less than the signed floor. Settlement reverts entirely. |
 | `Trampoline_OnlySubSolver()` | `claimToken` / `claimTokens` caller is not the sub-solver. |
+| `Trampoline_EthClaimFailed()` | Native ETH transfer failed during `claimToken`. |
 
 ### How BYOS interacts with Trampoline
 

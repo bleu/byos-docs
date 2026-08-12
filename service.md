@@ -10,7 +10,7 @@ The service binds two ports on one process, with opposite trust boundaries:
 
 | Listener | Default port | Serves | Trust level |
 |---|---|---|---|
-| **Public** | 9585 | `/proposals` (POST, GET, DELETE) | Internet-reachable, rate-limited |
+| **Public** | 9585 | `/proposals` (POST), `/proposal/:id` (GET, DELETE), `/proposals/by-sub-solver` (GET), `/proposals/:orderUid` (GET) | Internet-reachable |
 | **Internal** | 9586 | `/solve`, `/notify` | Firewalled, driver-only |
 
 They never share a socket. A `/solve` response contains the full standing proposal book for an auction — amounts, routes, and signatures, all MEV-relevant — so it must not be reachable from the public internet. An optional bearer token on `/solve` provides defense in depth.
@@ -21,16 +21,13 @@ They never share a socket. A `/solve` response contains the full standing propos
 
 ```mermaid
 flowchart LR
-    SS[Sub-solver] -->|POST /proposals| IP[IP rate limit]
-    IP --> PR[Parse + ecrecover]
+    SS[Sub-solver] -->|POST /proposals| PR[Parse + ecrecover]
     PR --> EX[Expiry window check]
-    EX --> SR[Signer rate limit]
-    SR --> ET[Escrow tier check<br/>cached, no RPC]
-    ET --> DB[(Store as Submitted)]
+    EX --> DB[(Store as Submitted)]
     DB --> R[202 Accepted + id]
 ```
 
-The request path does five things inline: IP rate limit, parse, `ecrecover`, expiry-window check, and signer rate limit. On success, the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted".
+The request path does three things inline: parse, `ecrecover`, and expiry-window check. On success, the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted".
 
 **All on-chain work is deferred.** The escrow balance check and settlement simulation run in a background validator loop, not on the request path. This decouples response latency from blockchain health and prevents DDoS on the public port from starving `/solve`.
 
@@ -55,8 +52,8 @@ The CoW driver notifies BYOS of outcomes via `POST /notify`. There is no chain w
 | Notification | Proposal transition |
 |---|---|
 | `SettlementStarted` | `Active` → `Executing` |
-| `Success { transaction }` | `Executing` → `Settled` |
-| `Revert { transaction }` | `Executing` → `SettleFailed` (triggers Track A debit) |
+| `Success { transaction }` | `Active` or `Executing` → `Settled` |
+| `Revert { transaction }` | `Active` or `Executing` → `SettleFailed` (triggers Track A debit) |
 | `Cancelled` / `Expired` / `Fail` | `Executing` → `Active` (queues non-settlement debit) |
 
 `/notify` joins to proposals through the `(auction_id, solution_id, proposal_id)` mapping that `/solve` records synchronously before returning solutions.
@@ -67,12 +64,12 @@ Three background loops run alongside the HTTP listeners:
 
 ### Validation loop
 
-Runs every ~12 seconds (one block), concurrency-bounded (8 concurrent RPC calls):
+Runs every ~12 seconds (one block):
 
 1. **Release stale executing proposals** — proposals stuck in `Executing` for more than 5 minutes (lost notification or restart) fall back to `Active`.
 2. **Expire proposals** — any `Submitted` or `Active` proposal with `validUntil < now` transitions to `Expired`.
 3. **Validate remaining proposals** — for each `Submitted` or `Active` proposal:
-   - **Escrow check** (cheap): `effectiveBalance(subSolver) >= gas_estimate × gas_price + min_collateral`. Reject if insufficient.
+   - **Escrow check** (cheap): `effectiveBalance(subSolver) >= ESCROW_GAS_ESTIMATION × gas_price + min_collateral`, where `ESCROW_GAS_ESTIMATION` is a fixed 200k gas floor. Reject if insufficient.
    - **Order envelope check** (no RPC): fill-or-kill amounts match, ERC20 balances only, no bridging orders.
    - **Settlement simulation** (expensive): full `settle()` via `eth_estimateGas` with state overrides. Records gas used, trampoline address, and token addresses on success.
    - **Profitability gate** (first validation only): `score = surplus - gas > 0`. Not re-applied on re-validation to avoid gas-price flapping churn.
@@ -108,6 +105,8 @@ stateDiagram-v2
     Active --> Expired: validUntil passed
     Submitted --> Cancelled: DELETE
     Active --> Cancelled: DELETE
+    Active --> Settled: driver Success\n(missed Started)
+    Active --> SettleFailed: driver Revert\n(missed Started)
     Executing --> Settled: driver Success
     Executing --> SettleFailed: driver Revert
     Executing --> Active: driver Cancelled/Fail,\nor timeout
@@ -128,13 +127,14 @@ Transitions are **compare-and-swap** — zero rows affected means the caller's v
 
 ## Persistence
 
-Postgres is the source of truth, with two tables serving different purposes:
+Postgres is the source of truth:
 
 | Table | Purpose | Retention |
 |---|---|---|
 | `proposals` | Current state — read by `GET`, `/solve`, `/notify`, and the validator | Live proposals indefinite; terminal states swept after 1 hour (except money states) |
 | `audit_events` | Append-only history — what happened, when, why | No deletion path. Dispute evidence for Track B claims arriving up to 3 months later. |
 | `solutions` | Attribution mapping `(auction_id, solution_id) → proposal_id` | Indefinite |
+| `penalties` | Pending non-settlement debits (queued by `Cancelled`/`Expired`/`Fail` notifications) | Processed by the penalty loop, then retained |
 
 The audit trail uses a write-behind pattern: events are emitted after their proposal write commits, persisted by a dedicated background worker. This decouples audit codec evolution from the store's hot path. The crash window (state change committed, audit event not yet persisted) is accepted at one event per crash.
 
@@ -156,8 +156,9 @@ BYOS's score is a **pre-ranking** that decides which proposals deserve the drive
 BYOS keeps the estimated gas cost of each settlement, in the order's sell token, as its revenue. It is declared as the fulfillment's `fee` field — a price wedge, not a deduction from the route.
 
 ```
-cut_in_wei = gas_used × effective_gas_price
-cut_in_sell_tokens = ceil(cut_in_wei / sell_token_price)
+effective_gas = gas_used + 30k buffer
+cut_in_wei = effective_gas × effective_gas_price
+cut_in_sell_tokens = ceil(cut_in_wei × 10^18 / sell_token_price)
 ```
 
 The cut is **not padded** — a larger cut lowers the score, which lowers CIP-85 consistency rewards. A proposal is skipped if the cut would breach the user's signed limit.

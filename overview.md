@@ -16,7 +16,7 @@ Becoming a CoW solver today is a gated process:
 
 A DEX aggregator, a routing API, or an independent quant who can find good routes has no way to participate without first finding a bonding pool willing to vouch for them and locking up significant capital.
 
-**After BYOS**, the barrier drops to a collateral deposit of roughly 0.010 ETH (the minimum, sized to cover one worst-case revert penalty) and the ability to sign an EIP-712 message and return a route.
+**After BYOS**, the barrier drops to a collateral deposit sized to cover one worst-case revert penalty (`gas + c_l`, where `c_l` is 0.010 ETH on mainnet) and the ability to sign an EIP-712 message and return a route.
 
 ## How it works
 
@@ -56,7 +56,7 @@ The flow:
 3. **BYOS validates** each proposal in the background: checks escrow balance, simulates the full settlement via `eth_estimateGas`, and scores it (`surplus - gas`).
 4. **When the CoW driver calls `/solve`**, BYOS answers instantly from its pool of validated proposals — no RPC, no simulation on the hot path. It picks the highest-scoring proposal per order.
 5. **The driver settles** the winning solution on-chain. The sub-solver's route executes inside a per-sub-solver sandbox contract (the Trampoline), isolated from settlement buffers.
-6. **If the settlement reverts**, BYOS debits the sub-solver's escrow to cover the gas cost.
+6. **If the settlement reverts**, BYOS debits the sub-solver's escrow for `gas + c_l` (gas cost plus the per-auction lower reward cap).
 
 ## What sub-solvers get and don't get
 
@@ -73,7 +73,7 @@ The flow:
 
 ## How BYOS earns revenue
 
-BYOS keeps the **gas cut** — the estimated gas cost of each settlement, denominated in the order's sell token. This is declared as a solver fee in the solution, and the difference stays in `GPv2Settlement`'s buffers. CoW's weekly accounting returns it to BYOS as the solver's network fee reimbursement.
+BYOS keeps the **gas cut** — the estimated gas cost of each settlement, denominated in the order's sell token. This is declared as a solver fee in the solution — a price wedge, not a deduction from the route. The difference stays in `GPv2Settlement`'s buffers and returns to BYOS via the weekly settlement payout. The protocol does not reimburse gas; what returns weekly is revenue BYOS retained from the trade.
 
 Only settled trades generate revenue.
 
