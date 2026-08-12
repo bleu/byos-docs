@@ -20,6 +20,7 @@ export default withMermaid({
 
   themeConfig: {
     nav: [
+      { text: 'Overview', link: '/overview' },
       { text: 'Design document', link: '/design-document' },
       { text: 'Sub-solver guide', link: '/guides/sub-solver-integration' },
       { text: 'Glossary', link: '/glossary' },
@@ -27,9 +28,15 @@ export default withMermaid({
 
     sidebar: [
       {
+        text: 'Overview',
+        items: [{ text: 'What is BYOS', link: '/overview' }],
+      },
+      {
         text: 'Specification',
         items: [
           { text: 'Design document', link: '/design-document' },
+          { text: 'Contracts reference', link: '/contracts' },
+          { text: 'Service architecture', link: '/service' },
           { text: 'Glossary', link: '/glossary' },
         ],
       },

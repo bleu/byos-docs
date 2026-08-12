@@ -64,7 +64,7 @@ BYOS requires **no changes to the CoW auction or competition**. It is a black bo
 
 The design problem is that CoW's safety model does not fit. `settle` is `onlySolver`, gated by a manager-curated allowlist; vouched solvers post a bond; a circuit breaker slashes or jails misbehavior. CoW trusts a permissioned, bonded set and punishes them rather than constraining what interactions may do. Sub-solvers are permissionless and unbonded — exactly the actor that model refuses to let near `settle`.
 
-So BYOS rebuilds the boundary structurally rather than socially. The Trampoline replaces the `onlySolver` allowlist with a sandbox. Escrow replaces the DAO bond. Debit and slash replace circuit-breaker slashing. Each substitution is load-bearing, and the rest of this document is what they mean concretely.
+So BYOS rebuilds the boundary structurally rather than socially. The Trampoline replaces the `onlySolver` allowlist with a sandbox. Escrow replaces the DAO bond. Debit and slash replace circuit-breaker slashing.
 
 ## Order flow
 
@@ -217,7 +217,7 @@ Per-instance isolation earns its keep on three things a shared trampoline cannot
 - `tx.origin` holds the Escrow's `SUBMITTER_ROLE` — a settlement submitted by BYOS.
 - The sub-solver's EIP-712 signature over the route verifies, and `validUntil` has not passed.
 
-**Signature-gating** exists so a reverted settlement self-evidences exactly what the sub-solver authorized: the signed data is in the calldata, recoverable from the transaction. This makes Track A debits verifiable by any third party rather than only by BYOS. Without it, BYOS could substitute different interactions, submit a settlement that reverts, and debit the sub-solver for a fault it manufactured. The cost is a single `ecrecover` per settlement, negligible against DEX swap costs.
+**Signature-gating** exists so a reverted settlement self-evidences exactly what the sub-solver authorized: the signed data is in the calldata, recoverable from the transaction. This makes Track A debits verifiable by any third party rather than only by BYOS. Without it, BYOS could substitute different interactions, submit a settlement that reverts, and debit the sub-solver for a fault it manufactured.
 
 **The submitter gate** exists because once BYOS settles a proposal, its signature and route are public calldata. While `validUntil` is live, any other allow-listed CoW solver could replay or front-run the `execute` in its own settlement, rerunning the signed route outside BYOS's control and muddying attribution. `SUBMITTER_ROLE` is granted by the Owner on the Escrow, which therefore acts as the submitter registry for its contract generation. It covers both the allow-listed solver EOA and, for CoW's `Solver7702Delegate` parallel path, each approved auxiliary account — there the auxiliary account, not the solver EOA, is `tx.origin`.
 
@@ -235,7 +235,7 @@ Anyone may deposit for a sub-solver. The sub-solver withdraws subject to a coold
 
 The contract is a **dumb ledger**. It enforces bounds — who may debit, cooldown, pause, freeze, transfer restrictions — but never the correctness of a debit's reason. Reserve calculations, proposal eligibility, and transfer-chain debit caps live in the service.
 
-**Deployment is immutable.** No proxy, no upgrade key. Immutability is a trust signal for sub-solvers: the code they deposit into will not change. A v2 means a new deployment, and the cooldown-based withdrawal makes migration straightforward. The Escrow's constructor deploys the Trampoline factory itself, taking the `GPv2Settlement` address rather than a factory address: instances bind to the Escrow as their submitter registry, and the factory needs the Escrow address before the Escrow could otherwise exist. Escrow, factory, and EIP-712 domain therefore form one deployment generation.
+**Deployment is immutable.** No proxy, no upgrade key. A v2 means a new deployment. The Escrow's constructor deploys the Trampoline factory itself, taking the `GPv2Settlement` address rather than a factory address: instances bind to the Escrow as their submitter registry, and the factory needs the Escrow address before the Escrow could otherwise exist. Escrow, factory, and EIP-712 domain therefore form one deployment generation.
 
 ### Escrow roles
 
@@ -348,7 +348,7 @@ Eip712Domain {
 
 **The nonce is a unique salt with no enforcement**, on-chain or off-chain. It makes each proposal's EIP-712 hash distinct; there is no ordering or uniqueness rule. Fill tracking alone would not prevent replay of `execute`, since a settlement need not include the order at all, so a third party could rerun a live proposal in a tradeless settlement. Third-party replay is blocked by the submitter gate instead ([`#execution-authority`](#execution-authority)). Replay by BYOS's own submitter remains possible by design: BYOS is trusted not to resubmit, `validUntil` bounds the window and is enforced on-chain, and a filled order cannot be settled again. Keeping the Trampoline storage-free is worth more than an on-chain nonce mapping.
 
-**The payload is raw interactions**, `Vec<{target, value, calldata}>` — arbitrary calls against any DEX or protocol, executed as-is. Structured routes would let BYOS author every call and forbid sub-solver approvals outright, but they would kill any-DEX generality, require BYOS to maintain a venue registry, and bottleneck sub-solver innovation. Containment is the Trampoline's job, structurally. The sub-solver is fully responsible for the complete route, including required hooks and approvals; BYOS can accept or reject at gatekeeping, never patch.
+**The payload is raw interactions**, `Vec<{target, value, calldata}>` — arbitrary calls against any DEX or protocol, executed as-is. Structured routes would let BYOS author every call and forbid sub-solver approvals outright, but they would kill any-DEX generality and require BYOS to maintain a venue registry. Containment is the Trampoline's job, structurally. The sub-solver is fully responsible for the complete route, including required hooks and approvals; BYOS can accept or reject at gatekeeping, never patch.
 
 The **factory is a domain anchor**. Binding `verifyingContract` to the TrampolineFactory cleanly separates contract generations: v1 signatures do not verify against a v2 factory. A factory redeployment invalidates all outstanding signatures, so sub-solver clients must update their domain configuration.
 
@@ -535,7 +535,7 @@ Before simulating, the order and proposal pair must pass a cheap envelope check 
 
 All four signature schemes are supported, since the scheme is encoded in the trade flags and GPv2 verifies it for real during simulation. Sell and buy orders are both supported, including native-ETH buys. Order hooks are included in the simulation for accurate gas, using the order's pre-encoded interactions from the orderbook; the `/solve` response does not include hooks, because the driver appends the order's own hooks itself.
 
-**A revert is terminal on the first occurrence.** No strikes, no retry. A proposal that reverted once is not robust enough to offer to `/solve` — if it won and then reverted on-chain, the sub-solver takes a Track A penalty, which is strictly worse for them than resubmitting. Resubmission is the sub-solver's "I still believe in this route" signal. Transport errors are different: an RPC timeout or DNS failure defers to the next tick rather than punishing the sub-solver, and orderbook 404s reject while transient orderbook errors defer.
+**A revert is terminal on the first occurrence.** No strikes, no retry. A proposal that reverted once is not offered to `/solve` — if it won and then reverted on-chain, the sub-solver takes a Track A penalty. Transport errors are different: an RPC timeout or DNS failure defers to the next tick rather than punishing the sub-solver, and orderbook 404s reject while transient orderbook errors defer.
 
 **The profitability gate runs on the first simulation only.** A score of zero or less rejects as unprofitable, matching `/solve`'s own inclusion rule, so one invariant holds: an `Active` proposal is one that could win an auction right now. It is not re-applied on re-validation, because gas prices wobble and rejecting on a spike would churn proposals that are profitable again two blocks later.
 
@@ -564,7 +564,7 @@ Settlement overhead is therefore paid per order and never amortized, and netting
 - **Surplus** is the improvement beyond the order's limit price — extra buy tokens on a sell order, sell tokens kept back on a buy order — converted at the auction's reference price.
 - **Gas** is the simulated `eth_estimateGas` result plus a 30k buffer, cached on the proposal, times the auction's effective gas price. The buffer is small because the full-settle estimate already covers intrinsic gas and the whole settlement path, so it only absorbs warm and cold storage differences and driver batching variance.
 
-**There is no fee term, and its absence is deliberate.** CoW's score is surplus plus protocol fees and nothing else; gas never appears as a subtraction there. It reaches the score only because a solver declares gas as its own fee, which lowers what the user receives, which lowers surplus. The protocol fee then cancels out of any ranking — it is carved out of surplus and added straight back — so `score = route surplus − our own cut`. Once the cut equals the gas cost ([`#gas`](#gas)), `surplus − gas` is the score the autopilot will compute for the bid.
+**There is no fee term.** CoW's score is surplus plus protocol fees and nothing else; gas never appears as a subtraction there. It reaches the score only because a solver declares gas as its own fee, which lowers what the user receives, which lowers surplus. The protocol fee then cancels out of any ranking — it is carved out of surplus and added straight back — so `score = route surplus − our own cut`. Once the cut equals the gas cost ([`#gas`](#gas)), `surplus − gas` is the score the autopilot will compute for the bid.
 
 **BYOS does not estimate protocol fees either.** The driver applies them itself, then encodes and simulates before bidding; a solution that cannot absorb the fee fails that simulation and is dropped, which costs the round but produces no revert, no penalty, and no escrow debit. It is also impossible to estimate before `/solve`, since fee policies are built per auction by the autopilot and delivered only in the `/solve` payload.
 
@@ -675,9 +675,9 @@ Track A and Track B penalties for the same settlement **stack**. There is no cre
 
 `c_l` is read from CoW's reward mechanism at debit time, with a hardcoded fallback for v1. Current values: **0.010 ETH** on Ethereum, **10 xDAI** on Gnosis.
 
-**Minimum escrow balance** is sized to cover worst-case Track A for a single settlement, `gas + c_l`. That keeps the barrier to entry low, which matters for a permissionless system. Track B is inherently under-collateralized regardless of the minimum, so a higher one would buy little.
+**Minimum escrow balance** is sized to cover worst-case Track A for a single settlement, `gas + c_l`.
 
-**On shortfall**, BYOS drains the remaining balance and absorbs the difference. The sub-solver is naturally suspended, since zero collateral means ineligible. There is no permanent ban and no debt tracking — bans are meaningless when a new address is a new identity, and the escrow loss is the penalty.
+**On shortfall**, BYOS drains the remaining balance and absorbs the difference. The sub-solver is suspended (zero collateral means ineligible). There is no permanent ban and no debt tracking.
 
 The **policy is immutable for v1**. No unilateral updates; a change requires a v2 policy with a new escrow deployment or a migration.
 
@@ -692,7 +692,7 @@ Routine, fast, provable.
 | Dispute | sub-solver | 72h window on narrow grounds: wrong attribution, the transaction did not revert, the amount exceeds `gas + c_l` | 72h |
 | Resolution | BYOS | reviews and decides, unilaterally | after the window |
 
-Track A is BYOS-unilateral because for reverts and deadline misses everything is on-chain verifiable: the receipt, the gas cost, and the Trampoline CREATE2 address that identifies the sub-solver. A provably incorrect debit is an operational bug, not a policy failure.
+Track A is BYOS-unilateral because for reverts and deadline misses everything is on-chain verifiable: the receipt, the gas cost, and the Trampoline CREATE2 address that identifies the sub-solver.
 
 **Non-settlement is detected from driver notifications**: a `Cancelled`, `Expired`, or `Fail` for an `Executing` proposal means the driver confirmed it began submitting and then abandoned the settlement with no transaction landing. That covers both submission failures and the driver's own block deadline. An executing *timeout* is deliberately not charged — a lost notification is not proof of non-settlement. This sub-category rests on BYOS's internal auction records and is not independently verifiable by the sub-solver, which is an accepted trust assumption.
 
@@ -722,23 +722,23 @@ Track B stays out of the proposal state machine: a ruling months later is an acc
 
 The 36h sub-solver window is tight, and permissionless participants without responsive operations may struggle. It is what remains after BYOS reserves the other 36h of its own 72h CoW window to process and relay.
 
-**Track B has an unrecoverable gap.** If the sub-solver has withdrawn, or the escrow is smaller than the claim, BYOS absorbs the difference. This is why gatekeeping is mandatory: it is the primary Track B defense, and escrow cannot be.
+**Track B has an unrecoverable gap.** If the sub-solver has withdrawn, or the escrow is smaller than the claim, BYOS absorbs the difference.
 
 ### Attribution
 
 **One sub-solver per settlement transaction.** The per-sub-solver Trampoline CREATE2 address in the settlement calldata self-evidences which sub-solver's route ran, with no reliance on BYOS's private records. That is what makes Track A debits indisputable and Track B attribution clean.
 
-The cost is less batching efficiency, accepted because clean attribution is worth more than marginal gas savings.
+The cost is less batching efficiency.
 
 Off-chain, notifications carry auction and solution ids rather than proposals, so attribution to a proposal is a join through the `solutions` mapping the engine writes before bidding ([`#proposal-lifecycle`](#proposal-lifecycle)). The Trampoline address in calldata remains the on-chain proof, checked when debiting.
 
 ### Gatekeeping
 
-Preventive, best-effort, and **non-exculpatory**. Before settling, BYOS validates that the proposal simulates without reverting, that required pre- and post-hooks from the order's app data are present in the interactions, and that the route is not obviously worse than reference AMM prices.
+Preventive, best-effort, and **non-exculpatory**. Before settling, BYOS validates that the proposal simulates without reverting and that the route is not obviously worse than reference AMM prices. BYOS includes the order's pre- and post-hooks in the simulation for accurate gas estimation; the driver appends them to the settlement separately ([`#solver-engine`](#solver-engine)).
 
-Sub-solvers are responsible for including required hooks in their own interactions. Some hooks change the token balances a route depends on — withdrawing DEX liquidity before a swap, for instance — so the sub-solver must see and simulate them to compute a correct route. BYOS rejects proposals missing required hooks before settlement, but passing gatekeeping does not absolve anyone: the EIP-712 signature is the sub-solver accepting responsibility for its complete route.
+Sub-solvers do not include hooks in their signed interactions — those contain only the routing calls. However, some hooks change the token balances a route depends on — withdrawing DEX liquidity before a swap, for instance — so the sub-solver must account for hook effects when computing a correct route. Passing gatekeeping does not absolve anyone: the EIP-712 signature is the sub-solver accepting responsibility for the route it signed.
 
-Simulation failures cost the sub-solver **nothing** beyond a rate-limit slot. Only on-chain failures debit escrow. Debiting simulation failures was rejected because they are usually environmental — a pool moved, the order filled elsewhere — so slashing them would punish honest participants and deter permissionless participation.
+Simulation failures cost the sub-solver **nothing** beyond a rate-limit slot. Only on-chain failures debit escrow. Simulation failures are not debited.
 
 ### Transparency
 
@@ -754,8 +754,6 @@ The `reason` field on `debit` carries the settlement transaction hash for a Trac
 
 **Strays are written off.** Tokens landing on an instance outside the settlement flow — mistaken transfers, airdrops, intermediate-token dust — are nobody's problem by design. A sub-solver with a standing route-planted approval can take them; preventing that is the un-enumerable approval-fighting problem the topology decision already rejected, and the amounts are donations and dust. Never user funds, trade capital, buffers, or escrow, all of which are protected by settlement atomicity and the floor check. If a sub-solver skims strays, the response is off-chain — gatekeeping, eviction — not a contract mechanism.
 
-**In-route capture is tolerated.** A sub-solver can keep surplus by capturing it in-route before the sweep. That is bid-neutral: it touches only value above its own signed floor, which it could have kept by signing a higher floor. Guarding against it would reopen the filtered-approval arms race. Uncaptured padding is a donation to BYOS.
+**In-route capture is tolerated.** A sub-solver can keep surplus by capturing it in-route before the sweep. That is bid-neutral: it touches only value above its own signed floor, which it could have kept by signing a higher floor. Guarding against it would reopen the filtered-approval arms race. The floor is the bid. A sub-solver signs the minimum it is sure to deliver, below its simulated route output, and margin sizing is its own tradeoff — too thin reverts and lands Track A debits, too thick loses auctions.
 
-The floor is the bid. A sub-solver signs the minimum it is sure to deliver, below its simulated route output, and margin sizing is its own tradeoff — too thin reverts and lands Track A debits, too thick loses auctions.
-
-Because the instance is genuinely empty at rest, "the instance is not a wallet" is literal: a planted approval over an empty contract drains nothing.
+The instance is empty at rest; a planted approval over an empty contract drains nothing.

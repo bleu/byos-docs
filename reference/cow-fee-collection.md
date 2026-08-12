@@ -98,7 +98,7 @@ sequenceDiagram
     W->>D: solver payout in native token<br/>(or overdraft if negative)
 ```
 
-Two consequences of the score formula worth remembering:
+Two consequences of the score formula:
 
 - Ranking is fee-neutral. Score counts protocol fees *as if collected*, computed by the autopilot
   from the executed amounts. A solver that skips the fee gives the user more surplus but the score
@@ -160,8 +160,7 @@ flowchart TD
 
 The model is trust-minimized, not trustless: it works because the fee debt is deterministically
 computable from on-chain data, and because a bonded solver has more at stake (bond + future
-revenue) than any single week's shortfall. A solver that walks away is recoverable only up to its
-bond — which is why solver onboarding is permissioned.
+revenue) than any single week's shortfall. A solver that walks away is recoverable only up to its bond.
 
 ## Who does what — summary
 

@@ -3,7 +3,7 @@
 > Consolidated from the official docs under <https://docs.cow.fi/cow-protocol/reference/core/auctions>.
 > Captured 2026-06-18 for offline consultation while exploring the BYOS RFP ([BYOS RFP](https://forum.cow.fi/t/rfp-bring-your-own-solver-byos/3469)). For authoritative/current text, follow the source link in each section.
 >
-> Why this matters for BYOS: BYOS is a bonded solver that must win the standard CoW auction. Everything below — how solutions are scored, how the fair combinatorial auction picks winners, EBBO, rewards, accounting, and bonding — applies to BYOS itself. Sub-solver proposals must ultimately produce a *valid, competitive* CoW solution under these rules.
+> Why this matters for BYOS: BYOS is a bonded solver that must win the standard CoW auction. Sub-solver proposals must produce a valid, competitive CoW solution under these rules.
 
 CoW Protocol uses an implementation of the [Fair Combinatorial Auction](https://arxiv.org/abs/2408.12225) (FCA) to execute trades. A **solver** is an algorithm that takes an auction instance (valid orders, liquidity state, protocol rules/fees) and outputs one or more **solutions** selecting order subsets and feasible amounts.
 

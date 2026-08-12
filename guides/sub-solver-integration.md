@@ -1,118 +1,178 @@
 # Sub-solver integration
 
-The path from zero to a settled proposal.
+This guide tells you how to go from zero to a settled proposal.
 
-This guide is about sequence and gotchas. Every normative fact — field names, amounts, signature shapes, penalty numbers — lives in [the design document](../design-document) or the [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml), and is linked rather than repeated. If this guide and one of those ever disagree, they are right.
+All normative facts (field names, amounts, signature formats, penalty amounts) are in [the design document](../design-document) or the [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml). This guide links to them and does not repeat them. If this guide and one of those disagree, the source document is correct.
 
-You do not need a CoW solver seat, an allowlist entry, or a relationship with the CoW DAO. You need an address, collateral in the escrow, and the ability to sign EIP-712 messages and quote a route.
+You do not need a CoW solver seat, an allowlist entry, or a relationship with CoW DAO. You need an address, collateral in the Escrow, and the ability to sign EIP-712 messages.
 
-## 1. What you are signing up for
+## Your role as a sub-solver
 
-You compute routes. BYOS bids them into CoW's auction under its own bonded solver seat, submits the settlement, and takes the consequences from the protocol. When a settlement carrying your route fails on-chain, BYOS charges that cost back to your escrow balance. **This is real money, debited without asking you first**, on the terms in [`#penalties`](../design-document#penalties).
+**You are responsible for:**
 
-The two things worth internalizing before you write any code:
+- **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
+- **Order selection.** Find orders in CoW's public orderbook. Compute any route that delivers buy tokens to the GPv2Settlement contract. Assume execution from Trampoline with sell tokens on it.
+- **Floor margin.** Set the `buyAmount` floor in your proposal. If the floor is too close to the route output, your route can revert on-chain (Track A debit). If the floor is too far below, you lose auctions.
+- **Venue-level fees.** If your route goes through a pool you operate, you keep those fees. To capture surplus above your floor, do it inside your route before the sweep. Any remaining tokens in the Trampoline belong to you to claim or use in future trades.
+- **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade.
 
-Your signature covers your **complete route**, including any pre- and post-hooks the order's app data requires. BYOS checks for them at gatekeeping and rejects proposals that omit them, but passing that check does not transfer liability. Gatekeeping is preventive and explicitly [non-exculpatory](../design-document#gatekeeping).
+**You are NOT responsible for:**
 
-The `buyAmount` you sign is a **floor, not a quote**. The contract enforces it as a minimum and reverts below it. Sizing that margin is your tradeoff and nobody else's: too thin and routes revert on-chain and cost you a [Track A](../design-document#track-a) debit, too thick and you lose auctions to sub-solvers who bid tighter.
+- **Transaction submission.** BYOS builds and submits the settlement through the CoW driver. You never call `settle`.
+- **Scoring.** BYOS scores proposals (`surplus - gas`), selects the best one per order, and bids it into CoW's auction.
+- **Gas estimation or fee calculation.** BYOS sizes the gas cut. The driver applies protocol and partner fees. Your amounts are raw, pre-fee route amounts.
+- **Trampoline contract logic.** The sweep, the floor check, and the sandbox isolation are in the contract code. You cannot change them.
+- **CoW protocol compliance.** BYOS manages the relationship with CoW DAO, the bonding pool, and the reward accounting. But gatekeeping is non-exculpatory. Your signed route is your responsibility.
+
+## 1. Understand the risks
+
+You compute routes. BYOS bids them into CoW's auction under its own bonded solver seat. BYOS submits the settlement and takes the consequences from the protocol.
+
+When a settlement that carries your route fails on-chain, BYOS debits the cost from your escrow balance. **BYOS debits this amount without prior approval.** Read the terms in [`#penalties`](../design-document#penalties).
+
+**The `buyAmount` is a floor, not a quote.** The contract enforces it as a minimum. If the route delivers less than this amount, the settlement reverts. You set the margin between the floor and the expected route output. A [Track A](../design-document#track-a) debit is the penalty for a revert. A floor that is too far below the output loses auctions.
 
 ## 2. Deposit collateral
 
-Deposit native token into the [Escrow](../design-document#escrow) for your address. Anyone may fund an address, but only that address can withdraw.
+Deposit native token into the [Escrow](../design-document#escrow) for your address. Any address can fund a sub-solver address. Only the sub-solver address can withdraw.
 
-Three things happen as a result:
+The deposit causes three effects:
 
-- You become eligible to submit proposals. The deposit *is* the permission — there is no allowlist. The minimum is sized to cover a single worst-case Track A debit ([`#penalties`](../design-document#penalties)).
-- Your [Trampoline](../design-document#topology) instance is deployed, at a deterministic CREATE2 address derived from your address. You pay that one-time gas. Routes never execute anywhere else.
-- Your rate limit is set. It scales with your balance ([`#proposal-api`](../design-document#proposal-api)), so a larger deposit buys throughput as well as eligibility.
+1. **You can submit proposals.** The deposit is the only requirement. The minimum balance must be enough for a single worst-case Track A debit ([`#penalties`](../design-document#penalties)).
+2. **BYOS deploys your [Trampoline](../design-document#topology) instance.** The instance has a deterministic CREATE2 address that is based on your address. You pay this one-time gas cost. All your routes execute in this instance.
+3. **BYOS sets your rate limit.** The rate limit scales with your balance ([`#proposal-api`](../design-document#proposal-api)). A larger deposit gives more throughput.
 
-Exiting is deliberately not instant. Withdrawal is all-or-nothing behind a cooldown, and requesting it takes you offline for new proposals immediately ([`#withdrawal-and-freeze`](../design-document#withdrawal-and-freeze)). Plan for that: a balance you might need to pull at short notice is not a balance you should be operating on.
+### Withdrawal
 
-To rotate keys, ERC20-`transfer` your escrow balance to the new address rather than doing a withdraw-and-redeposit cycle. Transfer avoids the uncollateralized gap. The new address gets its own Trampoline instance, and your old proposals do not follow you — your address is your identity in all three roles at once: proposal signer, escrow key, and CREATE2 salt ([`#proposal-schema`](../design-document#proposal-schema)).
+Withdrawal is not instant. It is all-or-nothing with a cooldown period. When you request a withdrawal, your effective balance drops to zero immediately. You cannot submit proposals during the cooldown. See [`#withdrawal-and-freeze`](../design-document#withdrawal-and-freeze).
+
+### Key rotation
+
+To rotate keys, use the ERC20 `transfer` function to move your escrow balance to the new address. Do not withdraw and redeposit. A transfer prevents the gap where you have no collateral.
+
+The new address gets its own Trampoline instance. Your old proposals do not follow you. Your address serves three roles: proposal signer, escrow key, and CREATE2 salt ([`#proposal-schema`](../design-document#proposal-schema)).
 
 ## 3. Find orders to route
 
-BYOS does not run an orderbook and does not push you work. Orders come from CoW's public orderbook API, the same source every other solver reads.
+BYOS does not operate an orderbook. Orders come from CoW's public orderbook API.
 
-Not every order is routable through BYOS. The [validation envelope](../design-document#simulation) rejects partially fillable orders, bridging orders, and orders using external or internal balance flavors. Filter for those before spending compute on a quote. Sell and buy orders are both supported, including native-ETH buys, and all four CoW signature schemes work.
-
-One proposal covers exactly one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format and no netting across orders.
+One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format.
 
 ## 4. Build a route
 
-A route is a list of raw calls: target, value, calldata. Any DEX, any protocol, no venue registry, no approval from BYOS. They execute as-is inside your Trampoline instance.
+A route is a list of raw calls. Each call has a target, a value, and calldata. You can use any DEX or protocol. BYOS does not maintain a venue registry. The calls execute as-is inside your Trampoline instance.
 
-What the sandbox means for how you write one:
+### Sandbox constraints
 
-The instance holds only the sell amount BYOS pushes in for this settlement. It has no allowance over `GPv2Settlement` and no access to anyone else's instance. So a route that assumes it can reach protocol buffers, or that plants an approval expecting to use it against a funded contract later, gets nothing — the instance is empty between settlements by construction ([`#topology`](../design-document#topology)).
+Your Trampoline instance holds only the sell amount that BYOS pushes in for this settlement. The instance has no allowance over `GPv2Settlement`. It has no access to other sub-solver instances. The instance is empty between settlements ([`#topology`](../design-document#topology)).
 
-You do not need to return funds yourself. The Trampoline sweeps both trade tokens back to the settlement and enforces your floor, in contract code you cannot override ([`#order-flow`](../design-document#order-flow)). Delivering output straight to the settlement also works; the check measures what the settlement actually received.
+A route that tries to access protocol buffers gets nothing. A route that plants an approval for future use against a funded contract gets nothing.
 
-Anything you deliver above your floor is **not yours** once the sweep runs. It becomes BYOS-owned settlement slippage. If you want to keep surplus, capture it inside your route before the sweep, or sign a higher floor — both are fine and neither is penalized ([`#residue`](../design-document#residue)).
+### Headroom
 
-Leave headroom above the user's limit price. BYOS takes a [gas cut](../design-document#gas) sized at the estimated settlement cost, and CoW's driver applies protocol and partner fees on top of that, after your amounts. A route quoted exactly at the limit produces an infeasible solution and will be skipped.
+Leave headroom above the user's limit price. BYOS takes a [gas cut](../design-document#gas) from the trade. The CoW driver applies protocol and partner fees on top. If a route quotes exactly at the limit, BYOS skips it because the solution is not feasible.
 
-Amounts you sign are **raw, pre-fee route amounts**. Do not try to pre-subtract fees; the wedge is created downstream by the driver's price shift and lands in the settlement, not in your instance.
+Sign **raw, pre-fee route amounts**. Do not pre-subtract fees. The driver creates the fee wedge after your amounts. The wedge stays in the settlement, not in your instance.
 
 ## 5. Sign the proposal
 
-Sign the EIP-712 typed data in [`#proposal-schema`](../design-document#proposal-schema). The struct, the domain, and the typehash are owned by the contracts repo — derive them from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts) and test against the contract's own vectors rather than re-deriving them yourself. The same signature the API accepts is verified again on-chain by your Trampoline at settlement, so a mismatch fails late and expensively.
+Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
 
-Two details that catch people:
+The API verifies your signature at submission. The Trampoline verifies the same signature on-chain at settlement. If the two do not match, the settlement fails.
 
-The domain binds to the TrampolineFactory address, so it is per-chain **and per deployment generation**. A contracts v2 invalidates every outstanding signature and you must update your domain config.
+### Domain binding
 
-Your route is committed to by hash. BYOS cannot substitute different interactions behind your signature — that is deliberate, and it is what makes a Track A debit something a third party can verify rather than something you have to take BYOS's word for.
+The EIP-712 domain binds to the TrampolineFactory address. The domain is specific to a chain **and** a deployment generation. A contracts v2 deployment invalidates all outstanding signatures. Update your domain configuration when contracts change.
 
-Keep `validUntil` short. It is capped at ingestion ([`#proposal-lifecycle`](../design-document#proposal-lifecycle)), and a route priced longer ago than a few minutes is stale anyway.
+### Route commitment
 
-## 6. Submit, then poll
+The `interactionsHash` field in the signed struct commits to your route. BYOS cannot substitute different interactions. A third party can verify that the signed data matches the settlement calldata. This property makes Track A debits verifiable.
 
-`POST` the proposal. Endpoints, payload shape, status codes, and typed rejection reasons are in the [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml).
+### Expiry
 
-**A `2xx` is not acceptance.** It means "accepted for validation" and hands you an id. Escrow checks and simulation run in a background loop, not on the request path ([`#proposal-api`](../design-document#proposal-api)). Integration code that treats a `2xx` as "my proposal is live" is wrong.
+Keep `validUntil` short. BYOS caps it at ingestion ([`#proposal-lifecycle`](../design-document#proposal-lifecycle)). A route that is more than a few minutes old is stale.
 
-Poll for the verdict. Reads are signature-gated and scoped to you — you sign a long-lived read token once and send it on every request, and you cannot see anyone else's proposals on an order, not even the fact that they exist. A proposal that is not yours returns 404 rather than 403, so do not read a 404 as "deleted".
+## 6. Submit and poll
 
-Expect a verdict within roughly one block, bounded by the validator tick rather than by your request. Latency budgets are in [SLO targets](../operations/slo-targets).
+Send a `POST` request with the proposal. See the [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml) for the payload format, status codes, and rejection reasons.
 
-Then keep polling. A live proposal is re-simulated every tick and can die at any point because the chain moved. Run a loop: quote, sign, submit, watch, resubmit. That loop is the intended operating mode, and several design decisions assume you have one.
+### API endpoints
 
-To withdraw a proposal before it settles, send a signed cancellation. Proposals are immutable, so there is no update — replace by cancelling and posting a new one.
+All endpoints are on the public listener (default port 9585):
 
-## 7. When things go wrong
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `202` with an id. This is **not** acceptance. |
+| `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. |
+| `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. |
+| `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. |
+| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Submitted` or `Active` proposals. |
 
-| What happened | What it costs you | What to do |
+### Read authentication
+
+Sign an EIP-712 `ReadAuth { version: 1 }` message once. Send it in the `X-Signature` header with every `GET` request. This signature has no timestamp or nonce. If it leaks, the risk is limited to read access to your own proposals. The signature does not grant write or cancellation access.
+
+If you query a proposal that is not yours, you get `404` (not `403`). You cannot check if a proposal id exists.
+
+### The response to POST is not acceptance
+
+A `2xx` response means "accepted for validation". BYOS stores the proposal as `Submitted` and returns an id. Escrow checks and simulation run in a background loop ([`#proposal-api`](../design-document#proposal-api)). Do not treat a `2xx` as "my proposal is live".
+
+### Poll for the verdict
+
+After you submit, poll for the verdict with `GET /proposal/{id}`. You can see only your own proposals. Expect a verdict within approximately one block. The validator tick interval determines the latency, not the request round-trip. See [SLO targets](../operations/slo-targets).
+
+Continue to poll after the first verdict. A live proposal is re-simulated every tick. It can fail at any time because chain state changed.
+
+Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended operating mode.
+
+### Cancel a proposal
+
+To cancel a proposal before it settles, send a signed `DELETE` request. Proposals are immutable. There is no update operation. To replace a proposal, cancel it and submit a new one.
+
+## 7. Error handling
+
+| What happened | Cost | Action |
 |---|---|---|
-| Rejected at gatekeeping | nothing | Read the typed reason and fix the route or the amounts. |
-| Simulation reverted | nothing beyond a rate-limit slot | The proposal is dropped permanently on the first revert, with no retries. Resubmit if you still believe in the route — resubmission is how you say so. |
-| Expired | nothing | Your `validUntil` passed. Shorten your loop. |
-| Lost the auction | nothing | Normal. Your proposal stays live and competes again next auction. |
-| Settlement reverted on-chain | a [Track A](../design-document#track-a) debit | Debited immediately. You have a dispute window on narrow, verifiable grounds. |
-| BYOS won and did not settle | a smaller Track A debit | Same window, same grounds. |
-| CoW raised an EBBO or fairness claim | a [Track B](../design-document#track-b) passthrough | Your balance is frozen on receipt and you get the certificate and evidence. Your refutation window is tight — see below. |
+| Rejected at gatekeeping | None | Read the typed rejection reason. Fix the route or the amounts. |
+| Simulation reverted | None (one rate-limit slot used) | The proposal is dropped on the first revert. There are no retries. Resubmit if the route is still valid. |
+| Expired | None | Your `validUntil` passed. Use a shorter interval. |
+| Lost the auction | None | Your proposal stays live and competes in the next auction. |
+| Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
+| BYOS won but did not settle | Smaller Track A debit | Same dispute window and grounds. |
+| CoW raised an EBBO or fairness claim | [Track B](../design-document#track-b) passthrough | BYOS freezes your balance and sends you the certificate and evidence. |
 
-Simulation failures are free on purpose. They are usually environmental — a pool moved, the order filled elsewhere — and charging for them would punish honest participants. Only on-chain failures touch your escrow.
+### Simulation failures
 
-Reverts caused by BYOS's own orchestration rather than your route are BYOS's cost, not yours.
+Simulation failures do not cost escrow. Only on-chain failures cause escrow debits. If a revert is caused by BYOS's own orchestration (not your route), BYOS pays.
 
-Track B is the one that needs operational readiness. Claims can arrive up to three months after the trade, your refutation window inside that is short, and the arbiter is the CoW core team rather than BYOS — so BYOS cannot fabricate a claim against you, but it also cannot waive one. If you cannot respond to evidence requests within a day and a half, that is a real risk to price in.
+### Track B operational readiness
 
-Every penalty action emits an on-chain Escrow event. That is the public record, and it is enough for you to audit your own history without trusting BYOS's private accounting.
+Track B claims need operational readiness. Claims can arrive up to three months after the trade. Your refutation window is 36 hours. The CoW core team arbitrates (not BYOS). BYOS cannot fabricate a claim against you, but it also cannot waive one.
 
-## 8. A worked example
+If you cannot respond to evidence requests within 36 hours, this is a risk you must plan for.
 
-The reference sub-solver in [`crates/subsolver`](https://github.com/bleu/byos-service/tree/main/crates/subsolver) is a working client and the counterpart in the end-to-end test suite. It does the whole loop: fetch orders, quote a baseline route, sign, submit, poll, resubmit.
+Every penalty action emits an on-chain Escrow event. You can use these events to audit your own history.
 
-It is Rust, but the protocol is language-neutral — what you want from it is the sequence, the EIP-712 construction, and the polling behaviour. Everything it does over the wire is specified in the OpenAPI document.
+## 8. Reference implementations
 
-## Checklist before you go live
+Two baseline sub-solver examples exist. Both do the full loop: fetch orders, compute a Uniswap V2 route, sign an EIP-712 proposal, submit, poll, and resubmit.
 
-- Escrow funded above the minimum, and your Trampoline deployed (a deposit does both).
-- EIP-712 hashes verified against contract-provided vectors, not your own re-derivation.
-- Domain configuration pinned to the right chain and contracts generation.
-- `validUntil` inside the ingestion cap.
-- Route leaves headroom above the user's limit for the gas cut and the driver's fee shift.
-- Required order hooks included in your interactions.
-- A polling loop that resubmits, rather than fire-and-forget submission.
-- An operational path for responding to a Track B claim inside its window.
+| Language | Location | Notes |
+|---|---|---|
+| **Rust** | [`crates/subsolver`](https://github.com/bleu/byos-service/tree/main/crates/subsolver) in `byos-service` | Used in the Rust service's end-to-end test suite. |
+| **TypeScript** | [`apps/subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/subsolver) in `byos-service-ts` | Uses viem for EIP-712 signing. Uses multicall for reserve fetching. |
+
+The protocol is language-neutral. Use either example for the sequence, the EIP-712 construction, and the polling behavior. The [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml) specifies all wire-level details.
+
+## Pre-launch checklist
+
+Before you go live, make sure that:
+
+- [ ] You funded the Escrow above the minimum. A deposit also deploys your Trampoline.
+- [ ] You verified your EIP-712 hashes against the contract's test vectors (not your own derivation).
+- [ ] Your domain configuration points to the correct chain and contracts generation.
+- [ ] Your `validUntil` value is within the ingestion cap.
+- [ ] Your route leaves headroom above the user's limit for the gas cut and the driver's fee shift.
+- [ ] You have a polling loop that resubmits (not fire-and-forget).
+- [ ] You have an operational process to respond to a Track B claim within 36 hours.
