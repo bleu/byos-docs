@@ -36,19 +36,19 @@ What is specified here versus what exists today. `n/a` means the section does no
 
 | Section | byos-contracts | byos-service (Rust) | byos-service-ts |
 |---|---|---|---|
-| [`#order-flow`](#order-flow) | implemented | implemented | planned |
-| [`#topology`](#topology) | implemented | implemented | planned |
-| [`#execution-authority`](#execution-authority) | implemented | implemented | planned |
-| [`#escrow`](#escrow) | implemented | partial | planned |
-| [`#proposal-schema`](#proposal-schema) | implemented | implemented | planned |
-| [`#proposal-api`](#proposal-api) | n/a | implemented | planned |
-| [`#proposal-lifecycle`](#proposal-lifecycle) | n/a | implemented | planned |
-| [`#solver-engine`](#solver-engine) | n/a | implemented | planned |
-| [`#gas`](#gas) | n/a | implemented | planned |
-| [`#penalties`](#penalties) | implemented | partial | planned |
+| [`#order-flow`](#order-flow) | implemented | implemented | implemented |
+| [`#topology`](#topology) | implemented | implemented | implemented |
+| [`#execution-authority`](#execution-authority) | implemented | implemented | implemented |
+| [`#escrow`](#escrow) | implemented | partial | partial |
+| [`#proposal-schema`](#proposal-schema) | implemented | implemented | implemented |
+| [`#proposal-api`](#proposal-api) | n/a | implemented | implemented |
+| [`#proposal-lifecycle`](#proposal-lifecycle) | n/a | implemented | implemented |
+| [`#solver-engine`](#solver-engine) | n/a | implemented | implemented |
+| [`#gas`](#gas) | n/a | implemented | implemented |
+| [`#penalties`](#penalties) | implemented | partial | partial |
 | [`#residue`](#residue) | implemented | n/a | n/a |
 
-`byos-service` is `partial` on escrow and penalties because Track B operations are triggered by hand in v1 rather than by an automated flow.
+Both services are `partial` on escrow and penalties because Track B operations (freeze, unfreeze) are triggered by hand in v1 rather than by an automated flow.
 
 ## Overview
 
