@@ -1,26 +1,8 @@
 # What is BYOS
 
-BYOS (Bring Your Own Solver) is a bonded CoW Protocol solver that opens CoW's order flow to **permissionless external routers** — called sub-solvers — without requiring them to go through the protocol's standard solver onboarding.
+BYOS (Bring Your Own Solver) is a bonded CoW Protocol solver. It lets external routers — called sub-solvers — submit routes to CoW auctions. Sub-solvers do not need a bonding pool, a DAO vote, or KYC. They deposit collateral into an escrow and sign EIP-712 proposals.
 
-## The problem BYOS solves
-
-Becoming a CoW solver today is a gated process:
-
-| Requirement | Standard pool (CIP-7) | Reduced pool (CIP-44) |
-|---|---|---|
-| Capital | $500,000 in stablecoins + 1,500,000 COW | $50,000–$100,000 + 500,000–1,000,000 COW |
-| Governance | Deploy a Gnosis Safe with CoW DAO as sole signer | Same Safe requirement |
-| Vouching | Vouched by an existing solver or the DAO | Core-team approval required |
-| Onboarding | Shadow competition and testing on Sepolia before mainnet access | Same requirement |
-| Compliance | KYC through the vouching solver's pool | Same |
-
-A DEX aggregator, a routing API, or an independent quant who can find good routes has no way to participate without first finding a bonding pool willing to vouch for them and locking up significant capital.
-
-**After BYOS**, the barrier drops to a collateral deposit sized to cover one worst-case revert penalty (`gas + c_l`, where `c_l` is 0.010 ETH on mainnet) and the ability to sign an EIP-712 message and return a route.
-
-## How it works
-
-BYOS sits between sub-solvers and the CoW auction as a single bonded solver. From the protocol's perspective it is an ordinary solver. Internally, it sources its solutions from anyone willing to post collateral.
+From the protocol side, BYOS is one ordinary solver. The sub-solver relationship is internal.
 
 ```mermaid
 flowchart LR
@@ -49,87 +31,48 @@ flowchart LR
     D --> A
 ```
 
-The flow:
+1. Sub-solvers find orders in the CoW orderbook and compute routes.
+2. Sub-solvers sign and submit proposals to BYOS.
+3. BYOS validates each proposal in the background.
+4. When the CoW driver calls `/solve`, BYOS returns its best proposal per order.
+5. The driver settles the solution on-chain through a per-sub-solver Trampoline contract.
+6. If the settlement reverts, BYOS debits the sub-solver's escrow.
 
-1. **Sub-solvers find orders** in CoW's public orderbook and compute routes using any DEX or protocol.
-2. **Sub-solvers sign and submit proposals** — EIP-712 messages committing to a specific order, route, and minimum output (`buyAmount` floor).
-3. **BYOS validates** each proposal in the background: checks escrow balance, simulates the full settlement via `eth_estimateGas`, and scores it (`surplus - gas`).
-4. **When the CoW driver calls `/solve`**, BYOS answers instantly from its pool of validated proposals — no RPC, no simulation on the hot path. It picks the highest-scoring proposal per order.
-5. **The driver settles** the winning solution on-chain. The sub-solver's route executes inside a per-sub-solver sandbox contract (the Trampoline), isolated from settlement buffers.
-6. **If the settlement reverts**, BYOS debits the sub-solver's escrow for `gas + c_l` (gas cost plus the per-auction lower reward cap).
+## Documentation map
 
-## What sub-solvers get and don't get
+### [Design document](design-document)
 
-| | Sub-solver | BYOS |
-|---|---|---|
-| **Route computation** | Responsible | Not involved |
-| **Transaction submission** | Not involved | Responsible (via CoW driver) |
-| **Scoring and auction bidding** | Not involved | Responsible |
-| **Revenue from own venue fees** | Keeps any fees their route earns at the DEX level (e.g., LP fees on a pool they operate) | Not involved |
-| **In-route surplus capture** | May capture surplus inside the route before the sweep ([details](design-document#residue)) | Keeps uncaptured surplus as settlement slippage |
-| **Gas cut** | Not charged directly | Retains the estimated gas cost on every settled trade ([details](design-document#gas)) |
-| **CoW solver rewards** | None in v1 — no reward pass-through | Retains 100% of CoW rewards earned under its bonded solver seat |
-| **Escrow risk** | Bears Track A (revert) and Track B (EBBO) penalties | Absorbs shortfall when escrow is insufficient |
+The normative specification. It defines the order flow, the proposal schema, the penalty schedule, the scoring model, and the gas cut. All other documents refer to it. If a document and the design document disagree, the design document is correct.
 
-## How BYOS earns revenue
+### [Contracts reference](contracts)
 
-BYOS keeps the **gas cut** — the estimated gas cost of each settlement, denominated in the order's sell token. This is declared as a solver fee in the solution — a price wedge, not a deduction from the route. The difference stays in `GPv2Settlement`'s buffers and returns to BYOS via the weekly settlement payout. The protocol does not reimburse gas; what returns weekly is revenue BYOS retained from the trade.
+Interface tables for Escrow, Trampoline, and TrampolineFactory: function signatures, events, errors, roles, and transfer restrictions. Use this page to look up a specific function or event. The [design document](design-document) explains why each contract works the way it does.
 
-Only settled trades generate revenue.
+### [Service architecture](service)
 
-Additionally, BYOS retains all **CoW solver rewards** (CIP-20/CIP-85 performance and consistency rewards) earned under its bonded solver address. Reward pass-through to sub-solvers is out of scope for v1.
+The off-chain service: two-listener model, proposal ingestion, the `/solve` handler, background workers (validation, penalties, retention), the state machine, persistence, and the scoring and gas cut formulas. Use this page to understand how the service processes proposals.
 
-## Why proposals get discarded
+### [Sub-solver integration guide](guides/sub-solver-integration)
 
-A proposal can be rejected at multiple stages. Here is every reason, consolidated:
+Step-by-step instructions to go from zero to a settled proposal. Covers escrow deposit, proposal construction, signature, submission, and what happens after settlement. Start here if you want to integrate as a sub-solver.
 
-### At submission (synchronous, immediate 4xx)
+### [Glossary](glossary)
 
-| Reason | Meaning |
-|---|---|
-| Invalid signature | Malformed signature hex or recovery failure |
-| Proposal expired | `validUntil` is already in the past |
-| Lifetime exceeded | `validUntil` is more than 5 minutes in the future (configurable) |
-| Rate limited | IP or signer rate limit exceeded |
+Definitions for all domain terms. Every implementation repo uses this vocabulary.
 
-### At validation (asynchronous, recorded on the proposal)
+### [SLO targets](operations/slo-targets)
 
-| Reason | Meaning |
-|---|---|
-| Insufficient escrow | Balance below the threshold (`gas estimate × gas price + minimum collateral`) |
-| Order not found | Order UID not in CoW's orderbook (filled, expired, or cancelled) |
-| Unsupported order | Non-ERC20 balance flavors, bridging orders, or (in v1) partially fillable orders |
-| Amount mismatch | Proposal amounts don't match the order (fill-or-kill mismatch, or partial fill violates limits) |
-| Unprofitable | Score (`surplus - gas`) is zero or negative on first simulation |
-| Simulation failed | The full settlement simulation reverted — terminal on first occurrence, no retries |
+Latency targets for `/solve`, `GET /proposals`, and the validation loop.
 
-### By lifecycle (not a rejection, but the proposal stops competing)
+### [Trampoline / settlement isolation](security/trampoline-settlement-isolation)
 
-| State | Cause |
-|---|---|
-| Expired | `validUntil` passed |
-| Cancelled | Sub-solver sent a signed `DELETE` |
-| Settled | The proposal won an auction and settled on-chain |
-| Settle failed | Settlement reverted on-chain — triggers a Track A penalty |
+Proof that a sub-solver's route cannot reach `GPv2Settlement` funds.
 
-## The slashing policy
+### CoW protocol reference
 
-When a settlement carrying a sub-solver's route causes BYOS to incur a cost from CoW, BYOS recovers it from the sub-solver's escrow. There are two tracks:
+Background material on the CoW mechanisms BYOS depends on:
 
-**Track A — routine, fast, provable.** Covers reverts, deadline misses, and non-settlements. BYOS debits immediately with no prior approval, because the facts are on-chain and verifiable by anyone. The sub-solver gets a 72-hour dispute window on narrow grounds (wrong attribution, the transaction didn't actually revert, the amount exceeds the cap).
-
-| Scenario | Debit amount |
-|---|---|
-| Settlement reverts on-chain | `gas used + c_l` |
-| Settlement misses block deadline | `gas used + c_l` |
-| Won auction, never settled | `10% of c_l` |
-
-`c_l` is CoW's per-auction lower reward cap: **0.010 ETH** on Ethereum mainnet, **10 xDAI** on Gnosis.
-
-**Track B — rare, slow, externally arbitrated.** Covers EBBO (Execution-Based Best Offer) violations and catch-all fairness claims. CoW's core team issues a certificate against BYOS; BYOS identifies the responsible sub-solver, freezes their escrow to block withdrawal, and gives them 36 hours to submit a refutation. The CoW core team — not BYOS — adjudicates. This means BYOS cannot fabricate a Track B claim, but it also cannot waive one.
-
-Track B claims can arrive up to **three months** after the trade. If the sub-solver has already withdrawn or the escrow balance is insufficient, BYOS absorbs the difference.
-
-**Simulation failures are free.** Only on-chain failures touch escrow. A proposal that fails simulation is dropped with no penalty.
-
-For the full normative specification, see [the design document](design-document#penalties).
+- [Fee collection](reference/cow-fee-collection) — how CoW collects and distributes fees.
+- [Solver slashing policy](reference/cow-solver-slashing-policy) — the penalty framework BYOS mirrors for sub-solvers.
+- [Solver auctions](reference/solver-auctions) — how the CoW auction and scoring work.
+- [Solver CIPs](reference/solver-cips) — the CIPs that govern solver competition rules.
