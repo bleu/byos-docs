@@ -734,9 +734,9 @@ Off-chain, notifications carry auction and solution ids rather than proposals, s
 
 ### Gatekeeping
 
-Preventive, best-effort, and **non-exculpatory**. Before settling, BYOS validates that the proposal simulates without reverting, that required pre- and post-hooks from the order's app data are present in the interactions, and that the route is not obviously worse than reference AMM prices.
+Preventive, best-effort, and **non-exculpatory**. Before settling, BYOS validates that the proposal simulates without reverting and that the route is not obviously worse than reference AMM prices. BYOS includes the order's pre- and post-hooks in the simulation for accurate gas estimation; the driver appends them to the settlement separately ([`#solver-engine`](#solver-engine)).
 
-Sub-solvers are responsible for including required hooks in their own interactions. Some hooks change the token balances a route depends on — withdrawing DEX liquidity before a swap, for instance — so the sub-solver must see and simulate them to compute a correct route. BYOS rejects proposals missing required hooks before settlement, but passing gatekeeping does not absolve anyone: the EIP-712 signature is the sub-solver accepting responsibility for its complete route.
+Sub-solvers do not include hooks in their signed interactions — those contain only the routing calls. However, some hooks change the token balances a route depends on — withdrawing DEX liquidity before a swap, for instance — so the sub-solver must account for hook effects when computing a correct route. Passing gatekeeping does not absolve anyone: the EIP-712 signature is the sub-solver accepting responsibility for the route it signed.
 
 Simulation failures cost the sub-solver **nothing** beyond a rate-limit slot. Only on-chain failures debit escrow. Simulation failures are not debited.
 
