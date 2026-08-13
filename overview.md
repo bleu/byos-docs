@@ -38,7 +38,7 @@ flowchart LR
 5. The driver settles the solution on-chain through a per-sub-solver Trampoline contract.
 6. If the settlement reverts, BYOS debits the sub-solver's escrow.
 
-## Interested in become a Sub-solver?
+## Interested in becoming a Sub-solver?
 
 Check the [Sub-solver integration guide](guides/sub-solver-integration). Step-by-step instructions to go from zero to a settled proposal.
 
