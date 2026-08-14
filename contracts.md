@@ -129,7 +129,7 @@ Transfers exist for **key rotation**: `transfer(newAddress, fullBalance)` moves 
 
 ## Trampoline
 
-A per-sub-solver execution sandbox. Receives the sell token, runs the sub-solver's signed route, sweeps both trade tokens back to `GPv2Settlement`, and enforces the `buyAmount` floor via a balance-delta check. Holds **zero balance at rest** — a planted approval over an empty contract drains nothing.
+A per-sub-solver execution sandbox. Receives the sell token, runs the sub-solver's signed route, sweeps both trade tokens back to `GPv2Settlement`, and enforces the `minBuyAmount` floor via a balance-delta check. Holds **zero balance at rest** — a planted approval over an empty contract drains nothing.
 
 ### Functions
 
@@ -156,9 +156,9 @@ Then:
 1. Records `GPv2Settlement`'s current buy-token balance.
 2. Executes each interaction as `call(gas, target, value, calldata)`.
 3. Sweeps full remaining balance of both trade tokens back to `GPv2Settlement`.
-4. Asserts the settlement's buy-token balance grew by at least `buyAmount`. Reverts if not.
+4. Asserts the settlement's buy-token balance grew by at least `minBuyAmount`. Reverts if not.
 
-Emits `Executed(orderUidHash, delta, floor)`.
+Emits `Executed(orderUidHash, delta, floor, ceiling)` where `floor` = `minBuyAmount` and `ceiling` = `maxBuyAmount`.
 
 #### Residue claim
 
@@ -183,7 +183,7 @@ These exist for intermediate-token dust and stray transfers. Trade tokens are sw
 
 | Event | When |
 |---|---|
-| `Executed(bytes32 orderUidHash, uint256 delta, uint256 floor)` | Route executed. `delta` = actual buy-token balance growth; `floor` = signed `buyAmount`. |
+| `Executed(bytes32 orderUidHash, uint256 delta, uint256 floor, uint256 ceiling)` | Route executed. `delta` = actual buy-token balance growth; `floor` = signed `minBuyAmount`; `ceiling` = signed `maxBuyAmount`. |
 | `ResidueClaimed(address token, uint256 amount, address recipient)` | Sub-solver claimed residue. |
 
 ### Errors
@@ -195,7 +195,7 @@ These exist for intermediate-token dust and stray transfers. Trade tokens are sw
 | `Trampoline_ProposalExpired()` | `block.timestamp > validUntil`. |
 | `Trampoline_NonceAlreadyUsed()` | Nonce was consumed in a prior execution. |
 | `Trampoline_InvalidSignature()` | Recovered signer is not `SUB_SOLVER`. |
-| `Trampoline_FloorNotMet(uint256 delta, uint256 floor)` | Route delivered less than the signed floor. Settlement reverts entirely. |
+| `Trampoline_FloorNotMet(uint256 delta, uint256 floor)` | Route delivered less than the signed `minBuyAmount` floor. Settlement reverts entirely. |
 | `Trampoline_OnlySubSolver()` | `claimToken` / `claimTokens` caller is not the sub-solver. |
 | `Trampoline_EthClaimFailed()` | Native ETH transfer failed during `claimToken`. |
 
@@ -203,6 +203,7 @@ These exist for intermediate-token dust and stray transfers. Trade tokens are sw
 
 - **At simulation**: builds a full `settle()` call via `eth_estimateGas` that includes `trampoline.execute(...)`. Uses state overrides for `AnyoneAuthenticator` and `SUBMITTER_ROLE`.
 - **At settlement**: the driver's encoded calldata includes two interactions — `sellToken.transfer(trampoline, sellAmount)` followed by `trampoline.execute(proposal, route, ...)`. The Trampoline address is computed from the sub-solver address via CREATE2, never stored.
+- **At post-settlement accounting**: reads the `Executed` event from the settlement transaction receipt. When `minBuyAmount < maxBuyAmount`, the `delta` and `ceiling` fields determine whether the sub-solver's escrow is debited or credited ([`#penalties`](design-document#track-a)).
 - **Never directly writes to Trampoline state.** All state changes happen within the `execute` call during settlement.
 
 ## TrampolineFactory

@@ -70,7 +70,7 @@ Runs every ~12 seconds (one block):
 2. **Expire proposals** — any `Submitted` or `Active` proposal with `validUntil < now` transitions to `Expired`.
 3. **Validate remaining proposals** — for each `Submitted` or `Active` proposal:
    - **Escrow check** (cheap): `effectiveBalance(subSolver) >= ESCROW_GAS_ESTIMATION × gas_price + min_collateral`, where `ESCROW_GAS_ESTIMATION` is a fixed 200k gas floor. Reject if insufficient.
-   - **Order envelope check** (no RPC): fill-or-kill amounts match, ERC20 balances only, no bridging orders.
+   - **Order envelope check** (no RPC): ERC20 balances only, no bridging orders, amounts consistent with order kind. For sell orders: `order.buyAmount <= minBuyAmount <= maxBuyAmount`, `maxBuyAmount` beats the limit price. For buy orders: `minBuyAmount == maxBuyAmount == order.buyAmount` (hard-reject otherwise). Partially fillable orders use the same constraints against scaled amounts.
    - **Settlement simulation** (expensive): full `settle()` via `eth_estimateGas` with state overrides. Records gas used, trampoline address, and token addresses on success.
    - **Profitability gate** (first validation only): `score = surplus - gas > 0`. Not re-applied on re-validation to avoid gas-price flapping churn.
 
@@ -78,12 +78,13 @@ A simulation revert is **terminal on first occurrence** — no strikes, no retri
 
 ### Penalty loop
 
-Runs on the same interval as validation. Processes Track A debits:
+Runs on the same interval as validation. Processes Track A debits and post-settlement slippage accounting:
 
 1. For each `SettleFailed` proposal: fetch settlement tx receipt, compute `gas_used × effective_gas_price + c_l`, call `escrow.debit(subSolver, amount, txHash)`.
 2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × c_l, orderUidHash)`.
-3. On success: transition to `Penalized`, record the debit tx hash.
-4. Retry up to 10 times on transient failures, then park for operator investigation.
+3. For each `Settled` proposal where `minBuyAmount < maxBuyAmount`: read the `Executed` event's `delta` from the settlement tx receipt. If `delta < maxBuyAmount`, convert the gap to ETH at the auction's reference price (stored in the `solutions` table) and call `escrow.debit`. If `delta > maxBuyAmount`, credit the sub-solver via a collateral deposit.
+4. On success: transition to `Penalized` (for Track A), record the debit tx hash.
+5. Retry up to 10 times on transient failures, then park for operator investigation.
 
 ### Retention sweep
 
@@ -133,7 +134,7 @@ Postgres is the source of truth:
 |---|---|---|
 | `proposals` | Current state — read by `GET`, `/solve`, `/notify`, and the validator | Live proposals indefinite; terminal states swept after 1 hour (except money states) |
 | `audit_events` | Append-only history — what happened, when, why | No deletion path. Dispute evidence for Track B claims arriving up to 3 months later. |
-| `solutions` | Attribution mapping `(auction_id, solution_id) → proposal_id` | Indefinite |
+| `solutions` | Attribution mapping `(auction_id, solution_id) → proposal_id`. Also stores the buy token's reference price from the auction for post-settlement slippage accounting. | Indefinite |
 | `penalties` | Pending non-settlement debits (queued by `Cancelled`/`Expired`/`Fail` notifications) | Processed by the penalty loop, then retained |
 
 The audit trail uses a write-behind pattern: events are emitted after their proposal write commits, persisted by a dedicated background worker. This decouples audit codec evolution from the store's hot path. The crash window (state change committed, audit event not yet persisted) is accepted at one event per crash.
@@ -144,7 +145,7 @@ The audit trail uses a write-behind pattern: events are emitted after their prop
 score = surplus - gas
 ```
 
-- **Surplus**: improvement beyond the order's limit price (extra buy tokens on a sell order, sell tokens kept back on a buy order), converted at the auction's reference price.
+- **Surplus**: improvement beyond the order's limit price (extra buy tokens on a sell order, sell tokens kept back on a buy order), computed from `maxBuyAmount` and converted at the auction's reference price.
 - **Gas**: simulated `eth_estimateGas` result + 30k buffer, times the auction's effective gas price.
 
 There is no fee term. CoW's score is `surplus + protocol fees`, and the protocol fee cancels out of ranking. Once the gas cut equals the gas cost, `surplus - gas` matches what the autopilot computes.

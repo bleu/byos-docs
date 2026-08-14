@@ -109,11 +109,11 @@ Actors:
 
 The funding transfer and `execute` are separate interactions because they run in different `msg.sender` contexts. The transfer-in runs as the settlement, which owns the funds; the route runs as the Trampoline. That split keeps the route from ever holding the settlement's spend authority.
 
-Inside `execute`, the instance records the settlement's buy-token balance, runs the sub-solver's route, sweeps its own full remaining balance of both trade tokens to the settlement, and reverts unless the settlement's buy-token balance grew by at least `buyAmount` — the signed floor. The sweep and the check are Trampoline contract code; the sub-solver supplies only the route.
+Inside `execute`, the instance records the settlement's buy-token balance, runs the sub-solver's route, sweeps its own full remaining balance of both trade tokens to the settlement, and reverts unless the settlement's buy-token balance grew by at least `minBuyAmount` — the signed floor. The sweep and the check are Trampoline contract code; the sub-solver supplies only the route.
 
 ### Happy path
 
-The route produces at least `buyAmount` of buy token. The sweep pushes everything the instance holds back to the settlement, the delta check passes, the settlement pays the user, and BYOS's buffer nets to zero. Anything above the floor is not stranded and not sub-solver property: it sits in the settlement as BYOS-owned slippage, returned by CoW's weekly accounting.
+The route produces at least `minBuyAmount` of buy token. The sweep pushes everything the instance holds back to the settlement, the delta check passes, the settlement pays the user, and BYOS's buffer nets to zero. Anything above the floor is not stranded and not sub-solver property: it sits in the settlement as BYOS-owned slippage, returned by CoW's weekly accounting.
 
 ```mermaid
 sequenceDiagram
@@ -131,9 +131,9 @@ sequenceDiagram
     T->>T: onlySettlement + submitter + validUntil + signature checks
     T->>T: record Settlement's buyToken balance
     T->>R: run route interactions
-    R-->>T: buyToken produced (>= buyAmount)
+    R-->>T: buyToken produced (>= minBuyAmount)
     T->>S: sweep full buyToken + sellToken balances
-    T->>T: assert Settlement buyToken delta >= buyAmount
+    T->>T: assert Settlement buyToken delta >= minBuyAmount
     S->>S: transferToAccounts pays the user
     S-->>D: settle() succeeds
     Note over S: anything above the floor stays here as<br/>BYOS-owned slippage, returned weekly
@@ -143,7 +143,7 @@ A route may also deliver output to the settlement directly instead of to the ins
 
 ### Shortfall
 
-The delta check fails and reverts the whole settlement. No trade, and BYOS's buffer is untouched. Below `buyAmount` nothing settles: the guard is an explicit assertion on the settlement's balance growth, so it also catches routes that deliver output somewhere other than the settlement.
+The delta check fails and reverts the whole settlement. No trade, and BYOS's buffer is untouched. Below `minBuyAmount` nothing settles: the guard is an explicit assertion on the settlement's balance growth, so it also catches routes that deliver output somewhere other than the settlement.
 
 ```mermaid
 sequenceDiagram
@@ -158,16 +158,16 @@ sequenceDiagram
     S->>T: execute(proposal, route, sellToken, buyToken, signature)
     T->>T: record Settlement's buyToken balance
     T->>R: run route interactions
-    R-->>T: buyToken produced (< buyAmount)
+    R-->>T: buyToken produced (< minBuyAmount)
     T->>S: sweep full buyToken + sellToken balances
-    T--xT: delta check fails: balance grew less than buyAmount
+    T--xT: delta check fails: balance grew less than minBuyAmount
     S--xD: settle() reverts, no state change
     Note over D: buffer never net-drained,<br/>sub-solver eats the Track A debit
 ```
 
 ### Buy orders
 
-Same mechanism, different slack. A buy order fixes the user's output, so the input is over-provisioned: the full signed `sellAmount` is pushed in, the route consumes only what it needs, and the sweep returns the unconsumed sell token to the settlement along with the output. The delta check is identical — the settlement's buy-token balance must grow by at least the floor, which for a buy order covers the user's exact `buyAmount`.
+Same mechanism, different slack. A buy order fixes the user's output, so the input is over-provisioned: the full signed `sellAmount` is pushed in, the route consumes only what it needs, and the sweep returns the unconsumed sell token to the settlement along with the output. The delta check is identical — the settlement's buy-token balance must grow by at least the floor. For a buy order, `minBuyAmount` must equal `maxBuyAmount` and must equal `order.buyAmount`.
 
 ```mermaid
 sequenceDiagram
@@ -182,9 +182,9 @@ sequenceDiagram
     S->>T: sellToken.transfer(trampoline, sellAmount) — raw signed input
     S->>T: execute(proposal, route, sellToken, buyToken, signature)
     T->>R: run route: consumes part of the input
-    R-->>T: buyToken produced (>= buyAmount)
+    R-->>T: buyToken produced (>= minBuyAmount)
     T->>S: sweep: all buyToken + unconsumed sellToken
-    T->>T: assert Settlement buyToken delta >= buyAmount
+    T->>T: assert Settlement buyToken delta >= minBuyAmount
     S->>S: transferToAccounts pays the user exactly buyAmount
     S-->>D: settle() succeeds
 ```
@@ -194,7 +194,7 @@ Nothing above is specific to an order kind. For either kind the instance receive
 | | Sell order | Buy order |
 |---|---|---|
 | User fixes | `sellAmount`; the route normally consumes all of it | `buyAmount`, the exact amount owed to the user |
-| Floor means | the minimum output the sub-solver commits to deliver | at least the user's exact `buyAmount` |
+| Floor means | the minimum output the sub-solver commits to deliver | at least the user's exact `buyAmount` (`minBuyAmount == maxBuyAmount`) |
 | Typical leftover | buy-token over-delivery above the floor | unconsumed sell token, returned by the sweep |
 
 The mechanism also covers same-token hook orders (`sellToken == buyToken`, always with `sellAmount > buyAmount`), where the user submits the order mainly to run hooks and the difference funds them. The delta check stays sound because the snapshot is taken after the funding transfer has already left `GPv2Settlement`: the sweep returning the unconsumed input is the delivery it measures, and the floor still guarantees the settlement is never net-drained. The shared token is swept once, and `execute` must not reject equal addresses.
@@ -206,6 +206,18 @@ The mechanism also covers same-token hook orders (`sellToken == buyToken`, alway
 | Exactly the floor | passes | succeeds | none |
 | Above the floor | passes | succeeds | swept to the settlement; BYOS-owned slippage, returned weekly |
 | Below the floor | reverts | reverts | none — no trade |
+
+### Floor and ceiling: `minBuyAmount` and `maxBuyAmount`
+
+The proposal carries two signed buy-amount fields. `minBuyAmount` is the floor — the hard revert threshold the delta check enforces on-chain. `maxBuyAmount` is the ceiling — the clearing-price commitment BYOS uses for scoring, gas-cut sizing, and settlement encoding. When `minBuyAmount` equals `maxBuyAmount`, the behavior is the same as a fixed-amount proposal.
+
+**Sell orders.** `sellAmount` equals the order's sell amount. When a sub-solver sets `minBuyAmount` lower than `maxBuyAmount`, the sub-solver opts into aggressive slippage. The delta check enforces `minBuyAmount`. The clearing price uses `maxBuyAmount`. The validation envelope enforces `order.buyAmount <= minBuyAmount <= maxBuyAmount`.
+
+After a successful settlement, if the route delivered less than `maxBuyAmount`, the difference is charged against the sub-solver's escrow. This is not a penalty — it mirrors how CoW charges BYOS for the same gap. The difference `maxBuyAmount − delta` is converted to ETH at the auction's reference price and debited from escrow. If the route over-delivers (`delta > maxBuyAmount`), BYOS credits the sub-solver later through a collateral deposit.
+
+**Buy orders.** The same struct fields exist, but aggressive slippage does not apply. In a sell order the sub-solver promises to deliver tokens. In a buy order the promise is to consume fewer tokens. BYOS has no mechanism to source the extra tokens (those not priced into the clearing price) for the sub-solver. A sub-solver who wants aggressive slippage on buy orders must pre-fund their Trampoline instance with buffer tokens. The validation envelope hard-rejects any buy-order proposal where `minBuyAmount != maxBuyAmount`.
+
+**Partially fillable orders** follow the same rules. The envelope validates `minBuyAmount` and `maxBuyAmount` against the proportionally scaled limit price.
 
 Where the fee wedge sits for each order kind, with worked numbers, is in [`reference/cow-fee-collection`](reference/cow-fee-collection) and summarized under [`#gas`](#gas).
 
@@ -226,7 +238,7 @@ Topology governs what happens to persistent state. Because the Trampoline runs s
 1. `GPv2Settlement` transfers exactly `sellAmount` of `sellToken` into the instance.
 2. The instance runs the sub-solver interactions.
 3. The instance sweeps its full remaining balance of both trade tokens back to `GPv2Settlement`.
-4. `execute` reverts unless the settlement's buy-token balance grew by at least `buyAmount`.
+4. `execute` reverts unless the settlement's buy-token balance grew by at least `minBuyAmount`.
 
 Approvals are not reset to zero. The enforced invariant is zero balance at rest rather than zero approvals, because approvals are per-`(token, spender)` over an unbounded, sub-solver-authored set and cannot be generically enumerated to reset, whereas balance is directly assertable. With the instance fund-less at rest and isolated per sub-solver, a standing or over-broad approval drains nothing belonging to the protocol or another sub-solver. BYOS-encoded approvals to known routers may be left standing and reused across that sub-solver's future settlements. Failed settlements revert atomically, rolling back any approval set in the attempt.
 
@@ -353,7 +365,8 @@ The EIP-712 typed data a sub-solver signs. This struct is verified twice: by the
 struct ProposalData {
     bytes32 orderUidHash;      // keccak256(order_uid) — ties to a specific order
     uint256 sellAmount;        // route consumption the instance receives (raw, pre-fee)
-    uint256 buyAmount;         // floor the route must deliver to the settlement (raw, pre-fee)
+    uint256 minBuyAmount;      // floor: minimum buy-token delta the contract enforces on-chain
+    uint256 maxBuyAmount;      // ceiling: clearing-price commitment used for scoring and settlement encoding
     bytes32 interactionsHash;  // keccak256(abi.encode(interactions)) — the route
     uint256 validUntil;        // expiry timestamp
     uint256 nonce;             // unique salt for signature uniqueness
@@ -369,7 +382,7 @@ Eip712Domain {
 }
 ```
 
-**Amounts are raw pre-fee quotes.** `sellAmount` is the route's consumption; the fee wedge the user pays on top stays in the settlement and is never forwarded. `buyAmount` is a floor, enforced by the balance-delta check ([`#order-flow`](#order-flow)), not an exact amount. Disputes compare on-chain outcomes against the signed amounts after applying the driver's deterministic fee shift ([`#gas`](#gas)).
+**Amounts are raw pre-fee quotes.** `sellAmount` is the route's consumption; the fee wedge the user pays on top stays in the settlement and is never forwarded. `minBuyAmount` is the on-chain floor, enforced by the balance-delta check ([`#order-flow`](#order-flow)). `maxBuyAmount` is the clearing-price commitment — the amount BYOS uses for scoring, gas-cut sizing, and settlement encoding. When both are equal, the behavior is a fixed-amount proposal. When `minBuyAmount` is lower, the sub-solver opts into aggressive slippage on sell orders ([`#order-flow`](#order-flow)). Disputes compare on-chain outcomes against the signed amounts after applying the driver's deterministic fee shift ([`#gas`](#gas)).
 
 **`interactionsHash` is required.** Without it, BYOS could substitute different interactions while presenting the same signed amounts, then blame the sub-solver for the resulting revert. The Trampoline verifies `keccak256(abi.encode(interactions)) == interactionsHash` before executing, so substituted interactions fail signature verification. This differs from CoW order signatures, which do not sign interactions, because the threat model is inverted: sub-solvers need protection against the operator, not against the execution path.
 
@@ -539,7 +552,7 @@ eth_estimateGas:
   to:   GPv2Settlement
   data: settle(
           tokens         = [sellToken, buyToken],
-          clearingPrices = [proposal.buyAmount, proposal.sellAmount],
+          clearingPrices = [proposal.maxBuyAmount, proposal.sellAmount],
           trades         = [the real order: fields and signature from the orderbook],
           interactions   = [[], [sellToken.transfer(trampoline, sellAmount),
                                  trampoline.execute(...)], []]
@@ -557,10 +570,13 @@ Order data is fetched once from the CoW orderbook and cached for the process lif
 
 Before simulating, the order and proposal pair must pass a cheap envelope check with no RPC:
 
-- Fill-or-kill only. Partially fillable orders are rejected.
 - No bridging orders.
 - `erc20` balance flavors only; external and internal balance orders are rejected.
-- Amounts consistent: a sell fill-or-kill needs `proposal.sellAmount == order.sellAmount`, a buy needs `proposal.buyAmount == order.buyAmount`. Fill-or-kill executes the order amount in full, so a proposal quoting anything else would simulate a different trade than the one settled.
+- Amounts consistent with the order kind:
+  - **Sell order (fill-or-kill):** `proposal.sellAmount == order.sellAmount`. The buy-amount envelope enforces `order.buyAmount <= proposal.minBuyAmount <= proposal.maxBuyAmount`, and `proposal.maxBuyAmount` must beat the order's limit price.
+  - **Buy order (fill-or-kill):** `proposal.minBuyAmount == proposal.maxBuyAmount == order.buyAmount`. A buy-order proposal where `minBuyAmount != maxBuyAmount` is hard-rejected — aggressive slippage does not apply to buy orders ([`#order-flow`](#order-flow)).
+  - **Partially fillable (sell):** `0 < proposal.sellAmount <= order.sellAmount`. The limit-price check and the `order.buyAmount <= minBuyAmount <= maxBuyAmount` constraint apply against proportionally scaled amounts.
+  - **Partially fillable (buy):** `proposal.minBuyAmount == proposal.maxBuyAmount`. The limit-price check applies against scaled amounts.
 
 All four signature schemes are supported, since the scheme is encoded in the trade flags and GPv2 verifies it for real during simulation. Sell and buy orders are both supported, including native-ETH buys. Order hooks are included in the simulation for accurate gas, using the order's pre-encoded interactions from the orderbook; the `/solve` response does not include hooks, because the driver appends the order's own hooks itself.
 
@@ -612,7 +628,7 @@ One winner per order UID, filtered and ranked at `/solve` time with local comput
 
 A winner with a non-positive score is not returned: settling a trade expected to cost more in gas than it earns in surplus is worse than skipping the order. The escrow re-check is not on this path — the background validator owns it.
 
-**Amount matching is strict, with no clamping.** Fill-or-kill proposals must satisfy the order's limit price; partially fillable proposals must not exceed the remaining fillable amount. BYOS never adapts proposal amounts, because the sub-solver computed a route for specific amounts and changing them would invalidate it. Sub-solvers resubmit through their polling loops when order state moves.
+**Amount matching is strict, with no clamping.** Fill-or-kill proposals must satisfy the order's limit price using `maxBuyAmount`; partially fillable proposals must not exceed the remaining fillable amount. BYOS never adapts proposal amounts, because the sub-solver computed a route for specific amounts and changing them would invalidate it. Sub-solvers resubmit through their polling loops when order state moves.
 
 **EBBO baseline is not re-checked at `/solve`.** The ingestion-time check is the primary gatekeeping layer, and re-running it on the hot path would add a price lookup for marginal safety.
 
@@ -634,7 +650,7 @@ The driver's `SolutionMerging` is set to **`Forbidden`**, because the driver mer
 | Field | Value |
 |---|---|
 | `id` | index within this response, 1-based; recorded against the proposal id so `/notify` can be attributed |
-| `prices` | cross-multiplied from the proposal amounts; unaffected by the cut, which is a declared fee rather than a price shade |
+| `prices` | cross-multiplied from `maxBuyAmount` and `sellAmount`; unaffected by the cut, which is a declared fee rather than a price shade |
 | `trades` | exactly one fulfillment |
 | `trades[0].fee` | the gas cut, in sell-token atoms — never absent |
 | `trades[0].executed_amount` | sell order: `order.sellAmount - fee`. Buy order: `order.buyAmount` |
@@ -727,6 +743,20 @@ Track A is BYOS-unilateral because for reverts and deadline misses everything is
 
 **Infra failures are excluded.** A settlement that reverts because of BYOS's own orchestration — a trampoline missing after a deposit-transaction reorg, for instance — is BYOS's cost. The engine must distinguish "sub-solver route reverted" from "BYOS orchestration failed" before debiting.
 
+### Post-settlement slippage accounting
+
+When a proposal uses aggressive slippage (`minBuyAmount < maxBuyAmount`) and the settlement succeeds, the difference between the clearing-price commitment and the actual delivery must be accounted for. This is not a penalty — it mirrors the charge or credit that CoW applies to BYOS for the same settlement.
+
+| Delivery vs ceiling | Effect |
+|---|---|
+| `delta < maxBuyAmount` | BYOS debits `maxBuyAmount − delta` (converted to ETH at the auction's reference price) from the sub-solver's escrow. |
+| `delta == maxBuyAmount` | No action. |
+| `delta > maxBuyAmount` | BYOS credits the sub-solver later through a collateral deposit. |
+
+The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-ETH conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The `solutions` table stores the buy token's reference price at `/solve` time so the penalty job can access it later.
+
+This accounting runs in the same background job as Track A debits. It processes `Settled` proposals where `minBuyAmount < maxBuyAmount`.
+
 ### Track B
 
 Rare, slow, a nested mirror of CoW's own process against BYOS.
@@ -779,10 +809,10 @@ The `reason` field on `debit` carries the settlement transaction hash for a Trac
 
 > Decision inverted 2026-07-22. Previously, route output above the signed floor and unconsumed sell tokens stranded in the instance as sub-solver-reclaimable **residue**, behind `claimToken`/`claimTokens`. Three premises fell: fees and slippage are price wedges, so surplus parked in the settlement returns to the solver weekly rather than being lost; the sub-solver persona is a DEX or routing API compensated by its own venue fees inside the route, not by leftovers; and the replay exposure that made parked balances unsafe was closed by the submitter gate.
 
-**There is no residue.** `execute` sweeps the instance's full remaining balance of both trade tokens to `GPv2Settlement` and enforces `buyAmount` as a floor via the balance-delta check. The instance ends every settlement holding none of the trade tokens. Over-delivery and unconsumed sell tokens are BYOS-owned settlement slippage, returned weekly by CoW's accounting. The claim functions are removed, and the Trampoline keeps zero privileged keys — with nothing resting in the instance, nobody needs one.
+**There is no residue.** `execute` sweeps the instance's full remaining balance of both trade tokens to `GPv2Settlement` and enforces `minBuyAmount` as a floor via the balance-delta check. The instance ends every settlement holding none of the trade tokens. Over-delivery and unconsumed sell tokens are BYOS-owned settlement slippage, returned weekly by CoW's accounting. The claim functions are removed, and the Trampoline keeps zero privileged keys — with nothing resting in the instance, nobody needs one.
 
 **Strays are written off.** Tokens landing on an instance outside the settlement flow — mistaken transfers, airdrops, intermediate-token dust — are nobody's problem by design. A sub-solver with a standing route-planted approval can take them; preventing that is the un-enumerable approval-fighting problem the topology decision already rejected, and the amounts are donations and dust. Never user funds, trade capital, buffers, or escrow, all of which are protected by settlement atomicity and the floor check. If a sub-solver skims strays, the response is off-chain — gatekeeping, eviction — not a contract mechanism.
 
-**In-route capture is tolerated.** A sub-solver can keep surplus by capturing it in-route before the sweep. That is bid-neutral: it touches only value above its own signed floor, which it could have kept by signing a higher floor. Guarding against it would reopen the filtered-approval arms race. The floor is the bid. A sub-solver signs the minimum it is sure to deliver, below its simulated route output, and margin sizing is its own tradeoff — too thin reverts and lands Track A debits, too thick loses auctions.
+**In-route capture is tolerated.** A sub-solver can keep surplus by capturing it in-route before the sweep. That is bid-neutral: it touches only value above its own signed floor, which it could have kept by signing a higher floor. Guarding against it would reopen the filtered-approval arms race. The floor is the bid. A sub-solver signs the `minBuyAmount` it is sure to deliver, below its simulated route output, and margin sizing is its own tradeoff — too thin reverts and lands Track A debits, too thick loses auctions.
 
 The instance is empty at rest; a planted approval over an empty contract drains nothing.
