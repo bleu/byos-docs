@@ -32,7 +32,7 @@ When a settlement that carries your route fails on-chain, BYOS debits the cost f
 
 **`minBuyAmount` is the floor, `maxBuyAmount` is the clearing-price commitment.** The contract enforces `minBuyAmount` as a minimum. If the route delivers less, the settlement reverts. `maxBuyAmount` is the amount BYOS bids into the auction — it determines the user's price and your score. A [Track A](../design-document#track-a) debit is the penalty for a revert. A `maxBuyAmount` that is too low loses auctions.
 
-**Aggressive slippage (sell orders only).** When you set `minBuyAmount < maxBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `maxBuyAmount`. If the route delivers between the two, the difference `maxBuyAmount − delivered` is converted to ETH and debited from your escrow. If the route over-delivers above `maxBuyAmount`, BYOS credits you later. This mechanism lets you bid more aggressively without reverting on marginal shortfalls — but you pay for the gap from your escrow. For buy orders, `minBuyAmount` must equal `maxBuyAmount`.
+**Aggressive slippage (sell orders only).** When you set `minBuyAmount < maxBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `maxBuyAmount`. If the route delivers between the two, the difference `maxBuyAmount − delivered` is converted to ETH and recorded as a slippage entry you owe. If the route over-delivers above `maxBuyAmount`, the difference is recorded as a credit. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Over-delivery credits that exceed the threshold are paid back via a collateral deposit. Monitor your running balance with `GET /slippage-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `maxBuyAmount`.
 
 ## 2. Deposit collateral
 
@@ -58,7 +58,7 @@ The new address gets its own Trampoline instance. Your old proposals do not foll
 
 BYOS does not operate an orderbook. Orders come from CoW's public orderbook API.
 
-One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format.
+One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format. Both fill-or-kill and partially fillable orders are supported. For partially fillable orders, your proposal's `sellAmount` can be any amount up to the order's remaining fillable amount, and both `minBuyAmount` and `maxBuyAmount` must independently satisfy the proportionally scaled limit price.
 
 ## 4. Build a route
 
@@ -108,6 +108,7 @@ All endpoints are on the public listener (default port 9585):
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. |
+| `GET` | `/slippage-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding slippage balance, the clearing threshold, and individual per-proposal entries. |
 | `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Submitted` or `Active` proposals. |
 
 ### Read authentication
@@ -177,6 +178,7 @@ Before you go live, make sure that:
 - [ ] Your `validUntil` value is within the ingestion cap.
 - [ ] Your route leaves headroom above the user's limit for the gas cut and the driver's fee shift.
 - [ ] For buy orders, `minBuyAmount == maxBuyAmount == order.buyAmount`.
-- [ ] For sell orders using aggressive slippage, you understand the escrow charge for the gap between `maxBuyAmount` and the actual delivery.
+- [ ] For sell orders using aggressive slippage, you understand the escrow charge for the gap between `maxBuyAmount` and the actual delivery. Monitor with `GET /slippage-balance`.
+- [ ] For partially fillable orders, your `sellAmount` does not exceed the remaining fillable amount, and both buy amounts satisfy the scaled limit price.
 - [ ] You have a polling loop that resubmits (not fire-and-forget).
 - [ ] You have an operational process to respond to a Track B claim within 36 hours.

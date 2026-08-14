@@ -26,6 +26,7 @@ These anchors are the interface between this document and every ADR that cites i
 | [`#gas`](#gas) | The gas cut and how CoW fees actually work |
 | [`#penalties`](#penalties) | The penalty schedule as a whole |
 | [`#track-a`](#track-a) | Revert, deadline, and non-settlement debits |
+| [`#post-settlement-slippage-accounting`](#post-settlement-slippage-accounting) | Slippage ledger, threshold clearing, credit payouts |
 | [`#track-b`](#track-b) | EBBO and fairness passthrough |
 | [`#attribution`](#attribution) | Mapping a settlement back to a sub-solver |
 | [`#residue`](#residue) | Surplus custody and stray tokens |
@@ -388,7 +389,7 @@ Eip712Domain {
 
 **There is no `escrow_account` field.** The recovered signer address *is* the escrow key, and the Trampoline CREATE2 salt. One address is load-bearing three ways. Delegation — sign with key K, collateral from account E — would complicate the Escrow's dumb-ledger design and is a v2 concern. A sub-solver running multiple strategies deposits separately per address. Key rotation moves collateral by ERC20 transfer ([`#withdrawal-and-freeze`](#withdrawal-and-freeze)) and gets a new Trampoline instance.
 
-**The nonce is a unique salt with no enforcement**, on-chain or off-chain. It makes each proposal's EIP-712 hash distinct; there is no ordering or uniqueness rule. Fill tracking alone would not prevent replay of `execute`, since a settlement need not include the order at all, so a third party could rerun a live proposal in a tradeless settlement. Third-party replay is blocked by the submitter gate instead ([`#execution-authority`](#execution-authority)). Replay by BYOS's own submitter remains possible by design: BYOS is trusted not to resubmit, `validUntil` bounds the window and is enforced on-chain, and a filled order cannot be settled again. Keeping the Trampoline storage-free is worth more than an on-chain nonce mapping.
+**The nonce is a unique salt, enforced on-chain.** Each Trampoline instance tracks used nonces in a `mapping(uint256 => bool)`. Any `uint256` is valid as long as it has not been consumed; there is no ordering rule. On-chain nonce enforcement provides hard replay protection independent of BYOS trust, at the cost of 20k gas for the first use of each nonce. Fill tracking alone would not prevent replay of `execute`, since a settlement need not include the order at all, so a third party could rerun a live proposal in a tradeless settlement. Third-party replay is additionally blocked by the submitter gate ([`#execution-authority`](#execution-authority)). Replay by BYOS's own submitter is prevented by the nonce check; `validUntil` further bounds the window.
 
 **The payload is raw interactions**, `Vec<{target, value, calldata}>` — arbitrary calls against any DEX or protocol, executed as-is. Structured routes would let BYOS author every call and forbid sub-solver approvals outright, but they would kill any-DEX generality and require BYOS to maintain a venue registry. Containment is the Trampoline's job, structurally. The sub-solver is fully responsible for the complete route, including required hooks and approvals; BYOS can accept or reject at gatekeeping, never patch.
 
@@ -404,6 +405,7 @@ The public HTTP surface by which sub-solvers submit signed proposals. Field-leve
 | `GET /proposal/{id}` | The caller's own proposal, including status and any rejection reason. |
 | `GET /proposals/{order_uid}` | The caller's own proposals on that order. |
 | `GET /proposals/by-sub-solver` | All of the caller's proposals. |
+| `GET /slippage-balance` | The caller's outstanding slippage balance, clearing threshold, and per-proposal entries. |
 | `DELETE /proposal/{id}` | Cancellation by the original signer. |
 
 `POST` does not carry token addresses. The orderbook order is the single source of truth for them, which removes a lying-client hazard.
@@ -747,13 +749,19 @@ Track A is BYOS-unilateral because for reverts and deadline misses everything is
 
 When a proposal uses aggressive slippage (`minBuyAmount < maxBuyAmount`) and the settlement succeeds, the difference between the clearing-price commitment and the actual delivery must be accounted for. This is not a penalty — it mirrors the charge or credit that CoW applies to BYOS for the same settlement.
 
-| Delivery vs ceiling | Effect |
-|---|---|
-| `delta < maxBuyAmount` | BYOS debits `maxBuyAmount − delta` (converted to ETH at the auction's reference price) from the sub-solver's escrow. |
-| `delta == maxBuyAmount` | No action. |
-| `delta > maxBuyAmount` | BYOS credits the sub-solver later through a collateral deposit. |
+| Delivery vs ceiling | Ledger entry | Sign |
+|---|---|---|
+| `delta < maxBuyAmount` | `maxBuyAmount − delta`, converted to ETH at the auction's reference price | Positive (sub-solver owes) |
+| `delta == maxBuyAmount` | No entry | — |
+| `delta > maxBuyAmount` | `delta − maxBuyAmount`, converted to ETH at the auction's reference price | Negative (BYOS owes) |
 
 The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-ETH conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The `solutions` table stores the buy token's reference price at `/solve` time so the penalty job can access it later.
+
+**Slippage is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `slippage_entries` table with its signed ETH amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `c_l`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
+
+The threshold prevents gas-inefficient micro-debits on small shortfalls and gives over-deliveries a chance to offset shortfalls within the same clearing cycle. A sub-solver that consistently over-delivers accumulates credits that reduce or eliminate future slippage debits. Credits that exceed the threshold in the opposite direction trigger a collateral deposit to the sub-solver's escrow.
+
+Sub-solvers can inspect their running slippage balance via `GET /slippage-balance` ([`#proposal-api`](#proposal-api)).
 
 This accounting runs in the same background job as Track A debits. It processes `Settled` proposals where `minBuyAmount < maxBuyAmount`.
 
@@ -803,15 +811,15 @@ Simulation failures cost the sub-solver **nothing** beyond a rate-limit slot. On
 
 The Escrow's on-chain events are the public record of every penalty action. There is no additional public reporting or dashboard, because one would leak competitive intelligence about sub-solver routing quality; on-chain events are enough for a sub-solver to audit its own history. BYOS notifies the affected sub-solver privately with full evidence.
 
-The `reason` field on `debit` carries the settlement transaction hash for a Track A revert, the order UID hash for non-settlement where no transaction exists, and the claim id for Track B.
+The `reason` field on `debit` carries the settlement transaction hash for a Track A revert, the order UID hash for non-settlement where no transaction exists, the claim id for Track B, and `keccak256(subSolver)` for slippage clearing debits.
 
 ## Residue
 
 > Decision inverted 2026-07-22. Previously, route output above the signed floor and unconsumed sell tokens stranded in the instance as sub-solver-reclaimable **residue**, behind `claimToken`/`claimTokens`. Three premises fell: fees and slippage are price wedges, so surplus parked in the settlement returns to the solver weekly rather than being lost; the sub-solver persona is a DEX or routing API compensated by its own venue fees inside the route, not by leftovers; and the replay exposure that made parked balances unsafe was closed by the submitter gate.
 
-**There is no residue.** `execute` sweeps the instance's full remaining balance of both trade tokens to `GPv2Settlement` and enforces `minBuyAmount` as a floor via the balance-delta check. The instance ends every settlement holding none of the trade tokens. Over-delivery and unconsumed sell tokens are BYOS-owned settlement slippage, returned weekly by CoW's accounting. The claim functions are removed, and the Trampoline keeps zero privileged keys — with nothing resting in the instance, nobody needs one.
+**There is no residue.** `execute` sweeps the instance's full remaining balance of both trade tokens to `GPv2Settlement` and enforces `minBuyAmount` as a floor via the balance-delta check. The instance ends every settlement holding none of the trade tokens. Over-delivery and unconsumed sell tokens are BYOS-owned settlement slippage, returned weekly by CoW's accounting.
 
-**Strays are written off.** Tokens landing on an instance outside the settlement flow — mistaken transfers, airdrops, intermediate-token dust — are nobody's problem by design. A sub-solver with a standing route-planted approval can take them; preventing that is the un-enumerable approval-fighting problem the topology decision already rejected, and the amounts are donations and dust. Never user funds, trade capital, buffers, or escrow, all of which are protected by settlement atomicity and the floor check. If a sub-solver skims strays, the response is off-chain — gatekeeping, eviction — not a contract mechanism.
+**Claim functions exist for strays.** `claimToken` and `claimTokens` let the sub-solver withdraw tokens that land on the instance outside the settlement flow — intermediate-token dust, mistaken transfers, airdrops. Trade tokens are swept by `execute` and never strand; the claim functions cover only non-trade-token residuals. They are sub-solver-only and cannot reach funds that belong to the protocol or another sub-solver, because the instance is isolated and empty of trade tokens at rest. Preventing sub-solver-authored claims is the un-enumerable approval-fighting problem the topology decision already rejected, and the amounts are donations and dust. Never user funds, trade capital, buffers, or escrow, all of which are protected by settlement atomicity and the floor check.
 
 **In-route capture is tolerated.** A sub-solver can keep surplus by capturing it in-route before the sweep. That is bid-neutral: it touches only value above its own signed floor, which it could have kept by signing a higher floor. Guarding against it would reopen the filtered-approval arms race. The floor is the bid. A sub-solver signs the `minBuyAmount` it is sure to deliver, below its simulated route output, and margin sizing is its own tradeoff — too thin reverts and lands Track A debits, too thick loses auctions.
 
