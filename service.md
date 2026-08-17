@@ -70,7 +70,7 @@ Runs every ~12 seconds (one block):
 2. **Expire proposals** — any `Submitted` or `Active` proposal with `validUntil < now` transitions to `Expired`.
 3. **Validate remaining proposals** — for each `Submitted` or `Active` proposal:
    - **Escrow check** (cheap): `effectiveBalance(subSolver) >= ESCROW_GAS_ESTIMATION × gas_price + min_collateral`, where `ESCROW_GAS_ESTIMATION` is a fixed 200k gas floor. Reject if insufficient.
-   - **Order envelope check** (no RPC): ERC20 balances only, no bridging orders, amounts consistent with order kind. For sell orders: `order.buyAmount <= minBuyAmount <= maxBuyAmount`, `maxBuyAmount` beats the limit price. For buy orders: `minBuyAmount == maxBuyAmount == order.buyAmount` (hard-reject otherwise). Partially fillable orders use the same constraints against scaled amounts.
+   - **Order envelope check** (no RPC): ERC20 balances only, no bridging orders, amounts consistent with order kind. For sell orders: `order.buyAmount <= minBuyAmount <= quotedBuyAmount`, `quotedBuyAmount` beats the limit price. For buy orders: `minBuyAmount == quotedBuyAmount == order.buyAmount` (hard-reject otherwise). Partially fillable orders use the same constraints against scaled amounts.
    - **Settlement simulation** (expensive): full `settle()` via `eth_estimateGas` with state overrides. Records gas used, trampoline address, and token addresses on success.
    - **Profitability gate** (first validation only): `score = surplus - gas > 0`. Not re-applied on re-validation to avoid gas-price flapping churn.
 
@@ -82,7 +82,7 @@ Runs on the same interval as validation. Processes Track A debits and post-settl
 
 1. For each `SettleFailed` proposal: fetch settlement tx receipt, compute `gas_used × effective_gas_price + c_l`, call `escrow.debit(subSolver, amount, txHash)`.
 2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × c_l, orderUidHash)`.
-3. **Slippage ledger** — for each `Settled` proposal where `minBuyAmount < maxBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`maxBuyAmount − delta`), convert to ETH at the auction's reference price (stored in the `solutions` table), and insert a `slippage_entries` row. Positive entries mean the sub-solver owes; negative entries (over-delivery) mean BYOS owes. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `c_l`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `slippageDebited` audit event. If the balance is negative beyond the threshold, credit the sub-solver via a collateral deposit.
+3. **Slippage ledger** — for each `Settled` proposal where `minBuyAmount < quotedBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quotedBuyAmount − delta`), convert to ETH at the auction's reference price (stored in the `solutions` table), and insert a `slippage_entries` row. Positive entries mean the sub-solver owes; negative entries (over-delivery) mean BYOS owes. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `c_l`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `slippageDebited` audit event. If the balance is negative beyond the threshold, credit the sub-solver via a collateral deposit.
 4. On success: transition to `Penalized` (for Track A), record the debit tx hash.
 5. Retry up to 10 times on transient failures, then park for operator investigation.
 
@@ -135,7 +135,7 @@ Postgres is the source of truth:
 | `proposals` | Current state — read by `GET`, `/solve`, `/notify`, and the validator | Live proposals indefinite; terminal states swept after 1 hour (except money states) |
 | `audit_events` | Append-only history — what happened, when, why | No deletion path. Dispute evidence for Track B claims arriving up to 3 months later. |
 | `solutions` | Attribution mapping `(auction_id, solution_id) → proposal_id`. Also stores the buy token's reference price from the auction for post-settlement slippage accounting. | Indefinite |
-| `slippage_entries` | Signed ledger of per-proposal slippage amounts for proposals using aggressive slippage (`minBuyAmount < maxBuyAmount`). Each entry records the gap between `maxBuyAmount` and the delivered `delta`, converted to ETH. Entries accumulate until the balance exceeds `c_l`, then are cleared in batch. Indexed by `(sub_solver, cleared)` and `proposal_id`. | Indefinite |
+| `slippage_entries` | Signed ledger of per-proposal slippage amounts for proposals using loose slippage (`minBuyAmount < quotedBuyAmount`). Each entry records the gap between `quotedBuyAmount` and the delivered `delta`, converted to ETH. Entries accumulate until the balance exceeds `c_l`, then are cleared in batch. Indexed by `(sub_solver, cleared)` and `proposal_id`. | Indefinite |
 | `penalties` | Pending non-settlement debits (queued by `Cancelled`/`Expired`/`Fail` notifications) | Processed by the penalty loop, then retained |
 
 The audit trail uses a write-behind pattern: events are emitted after their proposal write commits, persisted by a dedicated background worker. This decouples audit codec evolution from the store's hot path. The crash window (state change committed, audit event not yet persisted) is accepted at one event per crash.
@@ -146,7 +146,7 @@ The audit trail uses a write-behind pattern: events are emitted after their prop
 score = surplus - gas
 ```
 
-- **Surplus**: improvement beyond the order's limit price (extra buy tokens on a sell order, sell tokens kept back on a buy order), computed from `maxBuyAmount` and converted at the auction's reference price.
+- **Surplus**: improvement beyond the order's limit price (extra buy tokens on a sell order, sell tokens kept back on a buy order), computed from `quotedBuyAmount` and converted at the auction's reference price.
 - **Gas**: simulated `eth_estimateGas` result + 30k buffer, times the auction's effective gas price.
 
 There is no fee term. CoW's score is `surplus + protocol fees`, and the protocol fee cancels out of ranking. Once the gas cut equals the gas cost, `surplus - gas` matches what the autopilot computes.

@@ -12,7 +12,7 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 
 - **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
 - **Order selection.** Find orders in CoW's public orderbook. Compute any route that delivers buy tokens to the GPv2Settlement contract. Assume execution from Trampoline with sell tokens on it.
-- **Floor and ceiling.** Set `minBuyAmount` and `maxBuyAmount` in your proposal. `maxBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `maxBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < maxBuyAmount` to opt into aggressive slippage — but the gap between `maxBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `maxBuyAmount`.
+- **Floor and ceiling.** Set `minBuyAmount` and `quotedBuyAmount` in your proposal. `quotedBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quotedBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quotedBuyAmount` to opt into loose slippage — but the gap between `quotedBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quotedBuyAmount`.
 - **Venue-level fees.** If your route goes through a pool you operate, you keep those fees. To capture surplus above your floor, do it inside your route before the sweep.
 - **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade.
 
@@ -30,9 +30,9 @@ You compute routes. BYOS bids them into CoW's auction under its own bonded solve
 
 When a settlement that carries your route fails on-chain, BYOS debits the cost from your escrow balance. **BYOS debits this amount without prior approval.** Read the terms in [`#penalties`](../design-document#penalties).
 
-**`minBuyAmount` is the floor, `maxBuyAmount` is the clearing-price commitment.** The contract enforces `minBuyAmount` as a minimum. If the route delivers less, the settlement reverts. `maxBuyAmount` is the amount BYOS bids into the auction — it determines the user's price and your score. A [Track A](../design-document#track-a) debit is the penalty for a revert. A `maxBuyAmount` that is too low loses auctions.
+**`minBuyAmount` is the floor, `quotedBuyAmount` is the clearing-price commitment.** The contract enforces `minBuyAmount` as a minimum. If the route delivers less, the settlement reverts. `quotedBuyAmount` is the amount BYOS bids into the auction — it determines the user's price and your score. A [Track A](../design-document#track-a) debit is the penalty for a revert. A `quotedBuyAmount` that is too low loses auctions.
 
-**Aggressive slippage (sell orders only).** When you set `minBuyAmount < maxBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `maxBuyAmount`. If the route delivers between the two, the difference `maxBuyAmount − delivered` is converted to ETH and recorded as a slippage entry you owe. If the route over-delivers above `maxBuyAmount`, the difference is recorded as a credit. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Over-delivery credits that exceed the threshold are paid back via a collateral deposit. Monitor your running balance with `GET /slippage-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `maxBuyAmount`.
+**Loose slippage (sell orders only).** When you set `minBuyAmount < quotedBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `quotedBuyAmount`. If the route delivers between the two, the difference `quotedBuyAmount − delivered` is converted to ETH and recorded as a slippage entry you owe. If the route over-delivers above `quotedBuyAmount`, the difference is recorded as a credit. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Over-delivery credits that exceed the threshold are paid back via a collateral deposit. Monitor your running balance with `GET /slippage-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `quotedBuyAmount`.
 
 ## 2. Deposit collateral
 
@@ -58,7 +58,7 @@ The new address gets its own Trampoline instance. Your old proposals do not foll
 
 BYOS does not operate an orderbook. Orders come from CoW's public orderbook API.
 
-One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format. Both fill-or-kill and partially fillable orders are supported. For partially fillable orders, your proposal's `sellAmount` can be any amount up to the order's remaining fillable amount, and both `minBuyAmount` and `maxBuyAmount` must independently satisfy the proportionally scaled limit price.
+One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format. Both fill-or-kill and partially fillable orders are supported. For partially fillable orders, your proposal's `sellAmount` can be any amount up to the order's remaining fillable amount, and both `minBuyAmount` and `quotedBuyAmount` must independently satisfy the proportionally scaled limit price.
 
 ## 4. Build a route
 
@@ -78,7 +78,7 @@ Sign **raw, pre-fee route amounts**. Do not pre-subtract fees. The driver create
 
 ## 5. Sign the proposal
 
-Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). The `ProposalData` struct has seven fields: `orderUidHash`, `sellAmount`, `minBuyAmount`, `maxBuyAmount`, `interactionsHash`, `validUntil`, `nonce`. Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
+Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). The `ProposalData` struct has seven fields: `orderUidHash`, `sellAmount`, `minBuyAmount`, `quotedBuyAmount`, `interactionsHash`, `validUntil`, `nonce`. Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
 
 The API verifies your signature at submission. The Trampoline verifies the same signature on-chain at settlement. If the two do not match, the settlement fails.
 
@@ -177,8 +177,8 @@ Before you go live, make sure that:
 - [ ] Your domain configuration points to the correct chain and contracts generation.
 - [ ] Your `validUntil` value is within the ingestion cap.
 - [ ] Your route leaves headroom above the user's limit for the gas cut and the driver's fee shift.
-- [ ] For buy orders, `minBuyAmount == maxBuyAmount == order.buyAmount`.
-- [ ] For sell orders using aggressive slippage, you understand the escrow charge for the gap between `maxBuyAmount` and the actual delivery. Monitor with `GET /slippage-balance`.
+- [ ] For buy orders, `minBuyAmount == quotedBuyAmount == order.buyAmount`.
+- [ ] For sell orders using loose slippage, you understand the escrow charge for the gap between `quotedBuyAmount` and the actual delivery. Monitor with `GET /slippage-balance`.
 - [ ] For partially fillable orders, your `sellAmount` does not exceed the remaining fillable amount, and both buy amounts satisfy the scaled limit price.
 - [ ] You have a polling loop that resubmits (not fire-and-forget).
 - [ ] You have an operational process to respond to a Track B claim within 36 hours.
