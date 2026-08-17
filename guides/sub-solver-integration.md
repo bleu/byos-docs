@@ -32,7 +32,7 @@ When a settlement that carries your route fails on-chain, BYOS debits the cost f
 
 **`minBuyAmount` is the floor, `quoteBuyAmount` is the clearing-price commitment.** The contract enforces `minBuyAmount` as a minimum. If the route delivers less, the settlement reverts. `quoteBuyAmount` is the amount BYOS bids into the auction — it determines the user's price and your score. A [Track A](../design-document#track-a) debit is the penalty for a revert. A `quoteBuyAmount` that is too low loses auctions.
 
-**Loose slippage (sell orders only).** When you set `minBuyAmount < quoteBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `quoteBuyAmount`. If the route delivers between the two, the difference `quoteBuyAmount − delivered` is converted to ETH and recorded as a slippage entry you owe. If the route over-delivers above `quoteBuyAmount`, the difference is recorded as a credit. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Over-delivery credits that exceed the threshold are paid back via a collateral deposit. Monitor your running balance with `GET /slippage-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
+**Loose slippage (sell orders only).** When you set `minBuyAmount < quoteBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `quoteBuyAmount`. If the route delivers between the two, the difference `quoteBuyAmount − delivered` is converted to native token and recorded as a buffer entry you owe. If the route over-delivers above `quoteBuyAmount`, the difference is recorded as a credit that offsets future shortfalls but is never paid out. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Monitor your running balance with `GET /buffer-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
 
 ## 2. Deposit collateral
 
@@ -129,7 +129,7 @@ All endpoints are on the public listener (default port 9585):
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. |
-| `GET` | `/slippage-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding slippage balance, the clearing threshold, and individual per-proposal entries. |
+| `GET` | `/buffer-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding buffer balance, the clearing threshold, and individual per-proposal entries. |
 | `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Submitted` or `Active` proposals. |
 
 ### Read authentication
@@ -199,7 +199,7 @@ Before you go live, make sure that:
 - [ ] Your `validUntil` value is within the ingestion cap.
 - [ ] Your route leaves headroom above the user's limit for the gas cut and the driver's fee shift.
 - [ ] For buy orders, `minBuyAmount == quoteBuyAmount == order.buyAmount`.
-- [ ] For sell orders using loose slippage, you understand the escrow charge for the gap between `quoteBuyAmount` and the actual delivery. Monitor with `GET /slippage-balance`.
+- [ ] For sell orders using loose slippage, you understand the escrow charge for the gap between `quoteBuyAmount` and the actual delivery. Monitor with `GET /buffer-balance`.
 - [ ] If you are a private MM, your inventory is held in your own contract with an approval to your Trampoline — not deposited directly in the Trampoline instance.
 - [ ] For partially fillable orders, your `sellAmount` does not exceed the remaining fillable amount, and both buy amounts satisfy the scaled limit price.
 - [ ] You have a polling loop that resubmits (not fire-and-forget).

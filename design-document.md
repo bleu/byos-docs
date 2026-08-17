@@ -26,7 +26,7 @@ These anchors are the interface between this document and every ADR that cites i
 | [`#gas`](#gas) | The gas cut and how CoW fees actually work |
 | [`#penalties`](#penalties) | The penalty schedule as a whole |
 | [`#track-a`](#track-a) | Revert, deadline, and non-settlement debits |
-| [`#post-settlement-slippage-accounting`](#post-settlement-slippage-accounting) | Slippage ledger, threshold clearing, credit payouts |
+| [`#post-settlement-buffer-accounting`](#post-settlement-buffer-accounting) | Buffer ledger, threshold clearing |
 | [`#track-b`](#track-b) | EBBO and fairness passthrough |
 | [`#attribution`](#attribution) | Mapping a settlement back to a sub-solver |
 | [`#residue`](#residue) | Surplus custody and stray tokens |
@@ -214,7 +214,7 @@ The proposal carries two signed buy-amount fields. `minBuyAmount` is the floor �
 
 **Sell orders.** `sellAmount` equals the order's sell amount. When a sub-solver sets `minBuyAmount` lower than `quoteBuyAmount`, the sub-solver opts into loose slippage. The delta check enforces `minBuyAmount`. The clearing price uses `quoteBuyAmount`. The validation envelope enforces `order.buyAmount <= minBuyAmount <= quoteBuyAmount`.
 
-After a successful settlement, if the route delivered less than `quoteBuyAmount`, the difference is charged against the sub-solver's escrow. This is not a penalty — it mirrors how CoW charges BYOS for the same gap. The difference `quoteBuyAmount − delta` is converted to ETH at the auction's reference price and debited from escrow. If the route over-delivers (`delta > quoteBuyAmount`), BYOS credits the sub-solver later through a collateral deposit.
+After a successful settlement, if the route delivered less than `quoteBuyAmount`, the difference is charged against the sub-solver's escrow. This is not a penalty — it mirrors how CoW charges BYOS for the same gap. The difference `quoteBuyAmount − delta` is converted to native token at the auction's reference price and debited from escrow. If the route over-delivers (`delta > quoteBuyAmount`), the over-delivery is recorded as a credit that offsets future shortfalls but is never paid out.
 
 **Buy orders.** The same struct fields exist, but loose slippage does not apply. In a sell order the sub-solver promises to deliver tokens. In a buy order the promise is to consume fewer tokens. BYOS has no mechanism to source the extra tokens (those not priced into the clearing price) for the sub-solver. A sub-solver who wants loose slippage on buy orders must pre-fund their Trampoline instance with buffer tokens. The validation envelope hard-rejects any buy-order proposal where `minBuyAmount != quoteBuyAmount`.
 
@@ -405,7 +405,7 @@ The public HTTP surface by which sub-solvers submit signed proposals. Field-leve
 | `GET /proposal/{id}` | The caller's own proposal, including status and any rejection reason. |
 | `GET /proposals/{order_uid}` | The caller's own proposals on that order. |
 | `GET /proposals/by-sub-solver` | All of the caller's proposals. |
-| `GET /slippage-balance` | The caller's outstanding slippage balance, clearing threshold, and per-proposal entries. |
+| `GET /buffer-balance` | The caller's outstanding buffer balance, clearing threshold, and per-proposal entries. |
 | `DELETE /proposal/{id}` | Cancellation by the original signer. |
 
 `POST` does not carry token addresses. The orderbook order is the single source of truth for them, which removes a lying-client hazard.
@@ -745,23 +745,23 @@ Track A is BYOS-unilateral because for reverts and deadline misses everything is
 
 **Infra failures are excluded.** A settlement that reverts because of BYOS's own orchestration — a trampoline missing after a deposit-transaction reorg, for instance — is BYOS's cost. The engine must distinguish "sub-solver route reverted" from "BYOS orchestration failed" before debiting.
 
-### Post-settlement slippage accounting
+### Post-settlement buffer accounting
 
 When a proposal uses loose slippage (`minBuyAmount < quoteBuyAmount`) and the settlement succeeds, the difference between the clearing-price commitment and the actual delivery must be accounted for. This is not a penalty — it mirrors the charge or credit that CoW applies to BYOS for the same settlement.
 
 | Delivery vs ceiling | Ledger entry | Sign |
 |---|---|---|
-| `delta < quoteBuyAmount` | `quoteBuyAmount − delta`, converted to ETH at the auction's reference price | Positive (sub-solver owes) |
+| `delta < quoteBuyAmount` | `quoteBuyAmount − delta`, converted to native token at the auction's reference price | Positive (under-delivery debit) |
 | `delta == quoteBuyAmount` | No entry | — |
-| `delta > quoteBuyAmount` | `delta − quoteBuyAmount`, converted to ETH at the auction's reference price | Negative (BYOS owes) |
+| `delta > quoteBuyAmount` | `delta − quoteBuyAmount`, converted to native token at the auction's reference price | Negative (over-delivery credit) |
 
-The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-ETH conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The `solutions` table stores the buy token's reference price at `/solve` time so the penalty job can access it later.
+The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-native-token conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The `solutions` table stores the buy token's reference price at `/solve` time so the penalty job can access it later.
 
-**Slippage is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `slippage_entries` table with its signed ETH amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `c_l`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
+**Buffer accounting is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `buffer_entries` table with its signed native-token amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `c_l`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
 
-The threshold prevents gas-inefficient micro-debits on small shortfalls and gives over-deliveries a chance to offset shortfalls within the same clearing cycle. A sub-solver that consistently over-delivers accumulates credits that reduce or eliminate future slippage debits. Credits that exceed the threshold in the opposite direction trigger a collateral deposit to the sub-solver's escrow.
+The threshold prevents gas-inefficient micro-debits on small shortfalls and gives over-deliveries a chance to offset shortfalls within the same clearing cycle. A sub-solver that consistently over-delivers accumulates credits that reduce or eliminate future buffer debits. Over-delivery credits offset future shortfalls but are never paid out — they exist solely to avoid penalizing a sub-solver whose net delivery is on target.
 
-Sub-solvers can inspect their running slippage balance via `GET /slippage-balance` ([`#proposal-api`](#proposal-api)).
+Sub-solvers can inspect their running buffer balance via `GET /buffer-balance` ([`#proposal-api`](#proposal-api)).
 
 This accounting runs in the same background job as Track A debits. It processes `Settled` proposals where `minBuyAmount < quoteBuyAmount`.
 
@@ -811,7 +811,7 @@ Simulation failures cost the sub-solver **nothing** beyond a rate-limit slot. On
 
 The Escrow's on-chain events are the public record of every penalty action. There is no additional public reporting or dashboard, because one would leak competitive intelligence about sub-solver routing quality; on-chain events are enough for a sub-solver to audit its own history. BYOS notifies the affected sub-solver privately with full evidence.
 
-The `reason` field on `debit` carries the settlement transaction hash for a Track A revert, the order UID hash for non-settlement where no transaction exists, the claim id for Track B, and `keccak256(subSolver)` for slippage clearing debits.
+The `reason` field on `debit` carries the settlement transaction hash for a Track A revert, the order UID hash for non-settlement where no transaction exists, the claim id for Track B, and `keccak256(subSolver)` for buffer clearing debits.
 
 ## Residue
 

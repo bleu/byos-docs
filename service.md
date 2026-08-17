@@ -10,7 +10,7 @@ The service binds two ports on one process, with opposite trust boundaries:
 
 | Listener | Default port | Serves | Trust level |
 |---|---|---|---|
-| **Public** | 9585 | `/proposals` (POST), `/proposal/:id` (GET, DELETE), `/proposals/by-sub-solver` (GET), `/proposals/:orderUid` (GET), `/slippage-balance` (GET) | Internet-reachable |
+| **Public** | 9585 | `/proposals` (POST), `/proposal/:id` (GET, DELETE), `/proposals/by-sub-solver` (GET), `/proposals/:orderUid` (GET), `/buffer-balance` (GET) | Internet-reachable |
 | **Internal** | 9586 | `/solve`, `/notify` | Firewalled, driver-only |
 
 They never share a socket. A `/solve` response contains the full standing proposal book for an auction — amounts, routes, and signatures, all MEV-relevant — so it must not be reachable from the public internet. An optional bearer token on `/solve` provides defense in depth.
@@ -78,11 +78,11 @@ A simulation revert is **terminal on first occurrence** — no strikes, no retri
 
 ### Penalty loop
 
-Runs on the same interval as validation. Processes Track A debits and post-settlement slippage accounting:
+Runs on the same interval as validation. Processes Track A debits and post-settlement buffer accounting:
 
 1. For each `SettleFailed` proposal: fetch settlement tx receipt, compute `gas_used × effective_gas_price + c_l`, call `escrow.debit(subSolver, amount, txHash)`.
 2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × c_l, orderUidHash)`.
-3. **Slippage ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to ETH at the auction's reference price (stored in the `solutions` table), and insert a `slippage_entries` row. Positive entries mean the sub-solver owes; negative entries (over-delivery) mean BYOS owes. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `c_l`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `slippageDebited` audit event. If the balance is negative beyond the threshold, credit the sub-solver via a collateral deposit.
+3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `solutions` table), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `c_l`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
 4. On success: transition to `Penalized` (for Track A), record the debit tx hash.
 5. Retry up to 10 times on transient failures, then park for operator investigation.
 
@@ -134,8 +134,8 @@ Postgres is the source of truth:
 |---|---|---|
 | `proposals` | Current state — read by `GET`, `/solve`, `/notify`, and the validator | Live proposals indefinite; terminal states swept after 1 hour (except money states) |
 | `audit_events` | Append-only history — what happened, when, why | No deletion path. Dispute evidence for Track B claims arriving up to 3 months later. |
-| `solutions` | Attribution mapping `(auction_id, solution_id) → proposal_id`. Also stores the buy token's reference price from the auction for post-settlement slippage accounting. | Indefinite |
-| `slippage_entries` | Signed ledger of per-proposal slippage amounts for proposals using loose slippage (`minBuyAmount < quoteBuyAmount`). Each entry records the gap between `quoteBuyAmount` and the delivered `delta`, converted to ETH. Entries accumulate until the balance exceeds `c_l`, then are cleared in batch. Indexed by `(sub_solver, cleared)` and `proposal_id`. | Indefinite |
+| `solutions` | Attribution mapping `(auction_id, solution_id) → proposal_id`. Also stores the buy token's reference price from the auction for post-settlement buffer accounting. | Indefinite |
+| `buffer_entries` | Signed ledger of per-proposal buffer amounts for proposals using loose slippage (`minBuyAmount < quoteBuyAmount`). Each entry records the buy token, the gap between `quoteBuyAmount` and the delivered `delta`, converted to native token. Entries accumulate until the balance exceeds `c_l`, then are cleared in batch. Indexed by `(sub_solver, cleared)` and `proposal_id`. | Indefinite |
 | `penalties` | Pending non-settlement debits (queued by `Cancelled`/`Expired`/`Fail` notifications) | Processed by the penalty loop, then retained |
 
 The audit trail uses a write-behind pattern: events are emitted after their proposal write commits, persisted by a dedicated background worker. This decouples audit codec evolution from the store's hot path. The crash window (state change committed, audit event not yet persisted) is accepted at one event per crash.
