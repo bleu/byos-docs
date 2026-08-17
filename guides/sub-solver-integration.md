@@ -12,8 +12,8 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 
 - **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
 - **Order selection.** Find orders in CoW's public orderbook. Compute any route that delivers buy tokens to the GPv2Settlement contract. Assume execution from Trampoline with sell tokens on it.
-- **Floor margin.** Set the `buyAmount` floor in your proposal. If the floor is too close to the route output, your route can revert on-chain (Track A debit). If the floor is too far below, you lose auctions.
-- **Venue-level fees.** If your route goes through a pool you operate, you keep those fees. To capture surplus above your floor, do it inside your route before the sweep. Any remaining tokens in the Trampoline belong to you to claim or use in future trades.
+- **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into loose slippage — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
+- **Venue-level fees.** If your route goes through a pool you operate, you keep those fees. To capture surplus above your floor, do it inside your route before the sweep.
 - **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade.
 
 **You are NOT responsible for:**
@@ -30,7 +30,9 @@ You compute routes. BYOS bids them into CoW's auction under its own bonded solve
 
 When a settlement that carries your route fails on-chain, BYOS debits the cost from your escrow balance. **BYOS debits this amount without prior approval.** Read the terms in [`#penalties`](../design-document#penalties).
 
-**The `buyAmount` is a floor, not a quote.** The contract enforces it as a minimum. If the route delivers less than this amount, the settlement reverts. You set the margin between the floor and the expected route output. A [Track A](../design-document#track-a) debit is the penalty for a revert. A floor that is too far below the output loses auctions.
+**`minBuyAmount` is the floor, `quoteBuyAmount` is the clearing-price commitment.** The contract enforces `minBuyAmount` as a minimum. If the route delivers less, the settlement reverts. `quoteBuyAmount` is the amount BYOS bids into the auction — it determines the user's price and your score. A [Track A](../design-document#track-a) debit is the penalty for a revert. A `quoteBuyAmount` that is too low loses auctions.
+
+**Loose slippage (sell orders only).** When you set `minBuyAmount < quoteBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `quoteBuyAmount`. If the route delivers between the two, the difference `quoteBuyAmount − delivered` is converted to ETH and recorded as a slippage entry you owe. If the route over-delivers above `quoteBuyAmount`, the difference is recorded as a credit. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Over-delivery credits that exceed the threshold are paid back via a collateral deposit. Monitor your running balance with `GET /slippage-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
 
 ## 2. Deposit collateral
 
@@ -56,7 +58,7 @@ The new address gets its own Trampoline instance. Your old proposals do not foll
 
 BYOS does not operate an orderbook. Orders come from CoW's public orderbook API.
 
-One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format.
+One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format. Both fill-or-kill and partially fillable orders are supported. For partially fillable orders, your proposal's `sellAmount` can be any amount up to the order's remaining fillable amount, and both `minBuyAmount` and `quoteBuyAmount` must independently satisfy the proportionally scaled limit price.
 
 ## 4. Build a route
 
@@ -76,7 +78,7 @@ Sign **raw, pre-fee route amounts**. Do not pre-subtract fees. The driver create
 
 ## 5. Sign the proposal
 
-Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
+Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). The `ProposalData` struct has seven fields: `orderUidHash`, `sellAmount`, `minBuyAmount`, `quoteBuyAmount`, `interactionsHash`, `validUntil`, `nonce`. Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
 
 The API verifies your signature at submission. The Trampoline verifies the same signature on-chain at settlement. If the two do not match, the settlement fails.
 
@@ -106,6 +108,7 @@ All endpoints are on the public listener (default port 9585):
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. |
+| `GET` | `/slippage-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding slippage balance, the clearing threshold, and individual per-proposal entries. |
 | `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Submitted` or `Active` proposals. |
 
 ### Read authentication
@@ -170,9 +173,12 @@ The protocol is language-neutral. Use either example for the sequence, the EIP-7
 Before you go live, make sure that:
 
 - [ ] You funded the Escrow above the minimum. A deposit also deploys your Trampoline.
-- [ ] You verified your EIP-712 hashes against the contract's test vectors (not your own derivation).
+- [ ] You verified your EIP-712 hashes against the contract's test vectors (not your own derivation). The struct has seven fields.
 - [ ] Your domain configuration points to the correct chain and contracts generation.
 - [ ] Your `validUntil` value is within the ingestion cap.
 - [ ] Your route leaves headroom above the user's limit for the gas cut and the driver's fee shift.
+- [ ] For buy orders, `minBuyAmount == quoteBuyAmount == order.buyAmount`.
+- [ ] For sell orders using loose slippage, you understand the escrow charge for the gap between `quoteBuyAmount` and the actual delivery. Monitor with `GET /slippage-balance`.
+- [ ] For partially fillable orders, your `sellAmount` does not exceed the remaining fillable amount, and both buy amounts satisfy the scaled limit price.
 - [ ] You have a polling loop that resubmits (not fire-and-forget).
 - [ ] You have an operational process to respond to a Track B claim within 36 hours.
