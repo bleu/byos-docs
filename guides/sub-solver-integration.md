@@ -76,6 +76,27 @@ Leave headroom above the user's limit price. BYOS takes a [gas cut](../design-do
 
 Sign **raw, pre-fee route amounts**. Do not pre-subtract fees. The driver creates the fee wedge after your amounts. The wedge stays in the settlement, not in your instance.
 
+### Private market makers
+
+If you are a private market maker (MM) holding your own inventory, the Trampoline is your execution sandbox — not your funds contract. The standard routing pattern (compute a DEX route, let the Trampoline execute it) does not apply; instead, your route transfers buy tokens from your own contract into the settlement.
+
+**Why not hold inventory in the Trampoline?** The Trampoline receives sell tokens only because BYOS encodes a `sellToken.transfer(trampoline, sellAmount)` interaction in the settlement. If that transfer is omitted — due to a bug or compromise — your route still executes and delivers buy tokens, but you never receive the sell tokens. Routing sub-solvers are not exposed to this: their routes consume sell tokens through DEX swaps, so a missing funding transfer simply reverts the route. An MM transferring from its own inventory has no such natural guard.
+
+**Recommended pattern:**
+
+1. Deploy your own funds contract (or use an EOA) to hold buy-token inventory.
+2. Grant an ERC-20 approval from your funds contract to your Trampoline instance.
+3. Your signed route includes two interactions:
+   - `buyToken.transferFrom(yourContract, GPv2Settlement, buyAmount)` — delivers output directly to the settlement through the Trampoline.
+   - `sellToken.transfer(yourContract, sellAmount)` — forwards the sell tokens the Trampoline received to your contract, before the sweep.
+4. The Trampoline's sweep sends any remaining balances back to the settlement. The delta check enforces `minBuyAmount` as usual.
+
+Your inventory is safe: the approval is to your Trampoline instance only (isolated per sub-solver), and the route is committed via `interactionsHash` in your EIP-712 signature — BYOS cannot substitute different interactions.
+
+If your route does not explicitly forward sell tokens before the sweep, you can retrieve them post-settlement via `claimToken`.
+
+**Not recommended but not prevented:** you may deposit tokens directly into your Trampoline instance and trust BYOS to always include the funding transfer. BYOS has no incentive to omit it, but the trust assumption is stronger than necessary.
+
 ## 5. Sign the proposal
 
 Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). The `ProposalData` struct has seven fields: `orderUidHash`, `sellAmount`, `minBuyAmount`, `quoteBuyAmount`, `interactionsHash`, `validUntil`, `nonce`. Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
@@ -179,6 +200,7 @@ Before you go live, make sure that:
 - [ ] Your route leaves headroom above the user's limit for the gas cut and the driver's fee shift.
 - [ ] For buy orders, `minBuyAmount == quoteBuyAmount == order.buyAmount`.
 - [ ] For sell orders using loose slippage, you understand the escrow charge for the gap between `quoteBuyAmount` and the actual delivery. Monitor with `GET /slippage-balance`.
+- [ ] If you are a private MM, your inventory is held in your own contract with an approval to your Trampoline — not deposited directly in the Trampoline instance.
 - [ ] For partially fillable orders, your `sellAmount` does not exceed the remaining fillable amount, and both buy amounts satisfy the scaled limit price.
 - [ ] You have a polling loop that resubmits (not fire-and-forget).
 - [ ] You have an operational process to respond to a Track B claim within 36 hours.
