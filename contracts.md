@@ -159,7 +159,7 @@ Then:
 3. Sweeps full remaining balance of both trade tokens back to `GPv2Settlement`.
 4. Asserts the settlement's buy-token balance grew by at least `minBuyAmount`. Reverts if not.
 
-Emits `Executed(orderUidHash, delta, floor, ceiling)` where `floor` = `minBuyAmount` and `ceiling` = `quotedBuyAmount`.
+Emits `Executed(orderUidHash, delta, floor, ceiling)` where `floor` = `minBuyAmount` and `ceiling` = `quoteBuyAmount`.
 
 #### Residue claim
 
@@ -184,7 +184,7 @@ These exist for intermediate-token dust and stray transfers. Trade tokens are sw
 
 | Event | When |
 |---|---|
-| `Executed(bytes32 orderUidHash, uint256 delta, uint256 floor, uint256 ceiling)` | Route executed. `delta` = actual buy-token balance growth; `floor` = signed `minBuyAmount`; `ceiling` = signed `quotedBuyAmount`. |
+| `Executed(bytes32 orderUidHash, uint256 delta, uint256 floor, uint256 ceiling)` | Route executed. `delta` = actual buy-token balance growth; `floor` = signed `minBuyAmount`; `ceiling` = signed `quoteBuyAmount`. |
 | `ResidueClaimed(address token, uint256 amount, address recipient)` | Sub-solver claimed residue. |
 
 ### Errors
@@ -204,7 +204,7 @@ These exist for intermediate-token dust and stray transfers. Trade tokens are sw
 
 - **At simulation**: builds a full `settle()` call via `eth_estimateGas` that includes `trampoline.execute(...)`. Uses state overrides for `AnyoneAuthenticator` and `SUBMITTER_ROLE`.
 - **At settlement**: the driver's encoded calldata includes two interactions — `sellToken.transfer(trampoline, sellAmount)` followed by `trampoline.execute(proposal, route, ...)`. The Trampoline address is computed from the sub-solver address via CREATE2, never stored.
-- **At post-settlement accounting**: reads the `Executed` event from the settlement transaction receipt. When `minBuyAmount < quotedBuyAmount`, the `delta` and `ceiling` fields determine whether the sub-solver's escrow is debited or credited ([`#post-settlement-slippage-accounting`](design-document#post-settlement-slippage-accounting)).
+- **At post-settlement accounting**: reads the `Executed` event from the settlement transaction receipt. When `minBuyAmount < quoteBuyAmount`, the `delta` and `ceiling` fields determine whether the sub-solver's escrow is debited or credited ([`#post-settlement-slippage-accounting`](design-document#post-settlement-slippage-accounting)).
 - **Never directly writes to Trampoline state.** All state changes happen within the `execute` call during settlement.
 
 ## TrampolineFactory
