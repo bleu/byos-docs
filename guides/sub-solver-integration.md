@@ -12,7 +12,7 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 
 - **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
 - **Order selection.** Find orders in CoW's public orderbook. Compute any route that delivers buy tokens to the GPv2Settlement contract. Assume execution from Trampoline with sell tokens on it.
-- **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into a loose buffer — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
+- **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into loose slippage — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
 - **Venue-level fees.** If your route goes through a pool you operate, you keep those fees. To capture surplus above your floor, do it inside your route before the sweep.
 - **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade.
 
@@ -32,7 +32,7 @@ When a settlement that carries your route fails on-chain, BYOS debits the cost f
 
 **`minBuyAmount` is the floor, `quoteBuyAmount` is the clearing-price commitment.** The contract enforces `minBuyAmount` as a minimum. If the route delivers less, the settlement reverts. `quoteBuyAmount` is the amount BYOS bids into the auction — it determines the user's price and your score. A [Track A](../design-document#track-a) debit is the penalty for a revert. A `quoteBuyAmount` that is too low loses auctions.
 
-**Loose buffer (sell orders only).** When you set `minBuyAmount < quoteBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `quoteBuyAmount`. If the route delivers between the two, the difference `quoteBuyAmount − delivered` is converted to native token and recorded as a buffer entry you owe. If the route over-delivers above `quoteBuyAmount`, the difference is recorded as a credit that offsets future shortfalls but is never paid out. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Monitor your running balance with `GET /buffer-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
+**Loose slippage (sell orders only).** When you set `minBuyAmount < quoteBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `quoteBuyAmount`. If the route delivers between the two, the difference `quoteBuyAmount − delivered` is converted to native token and recorded as a buffer entry you owe. If the route over-delivers above `quoteBuyAmount`, the difference is recorded as a credit that offsets future shortfalls but is never paid out. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Monitor your running balance with `GET /buffer-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
 
 ## 2. Deposit collateral
 
@@ -199,7 +199,7 @@ Before you go live, make sure that:
 - [ ] Your `validUntil` value is within the ingestion cap.
 - [ ] Your route leaves headroom above the user's limit for the gas cut and the driver's fee shift.
 - [ ] For buy orders, `minBuyAmount == quoteBuyAmount == order.buyAmount`.
-- [ ] For sell orders using a loose buffer, you understand the escrow charge for the gap between `quoteBuyAmount` and the actual delivery. Monitor with `GET /buffer-balance`.
+- [ ] For sell orders using loose slippage, you understand the escrow charge for the gap between `quoteBuyAmount` and the actual delivery. Monitor with `GET /buffer-balance`.
 - [ ] If you are a private MM, your inventory is held in your own contract with an approval to your Trampoline — not deposited directly in the Trampoline instance.
 - [ ] For partially fillable orders, your `sellAmount` does not exceed the remaining fillable amount, and both buy amounts satisfy the scaled limit price.
 - [ ] You have a polling loop that resubmits (not fire-and-forget).

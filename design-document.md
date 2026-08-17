@@ -212,11 +212,11 @@ The mechanism also covers same-token hook orders (`sellToken == buyToken`, alway
 
 The proposal carries two signed buy-amount fields. `minBuyAmount` is the floor — the hard revert threshold the delta check enforces on-chain. `quoteBuyAmount` is the ceiling — the clearing-price commitment BYOS uses for scoring, gas-cut sizing, and settlement encoding. When `minBuyAmount` equals `quoteBuyAmount`, the behavior is the same as a fixed-amount proposal.
 
-**Sell orders.** `sellAmount` equals the order's sell amount. When a sub-solver sets `minBuyAmount` lower than `quoteBuyAmount`, the sub-solver opts into a loose buffer. The delta check enforces `minBuyAmount`. The clearing price uses `quoteBuyAmount`. The validation envelope enforces `order.buyAmount <= minBuyAmount <= quoteBuyAmount`.
+**Sell orders.** `sellAmount` equals the order's sell amount. When a sub-solver sets `minBuyAmount` lower than `quoteBuyAmount`, the sub-solver opts into loose slippage. The delta check enforces `minBuyAmount`. The clearing price uses `quoteBuyAmount`. The validation envelope enforces `order.buyAmount <= minBuyAmount <= quoteBuyAmount`.
 
 After a successful settlement, if the route delivered less than `quoteBuyAmount`, the difference is charged against the sub-solver's escrow. This is not a penalty — it mirrors how CoW charges BYOS for the same gap. The difference `quoteBuyAmount − delta` is converted to native token at the auction's reference price and debited from escrow. If the route over-delivers (`delta > quoteBuyAmount`), the over-delivery is recorded as a credit that offsets future shortfalls but is never paid out.
 
-**Buy orders.** The same struct fields exist, but the loose buffer does not apply. In a sell order the sub-solver promises to deliver tokens. In a buy order the promise is to consume fewer tokens. BYOS has no mechanism to source the extra tokens (those not priced into the clearing price) for the sub-solver. A sub-solver who wants a loose buffer on buy orders must pre-fund their Trampoline instance with buffer tokens. The validation envelope hard-rejects any buy-order proposal where `minBuyAmount != quoteBuyAmount`.
+**Buy orders.** The same struct fields exist, but loose slippage does not apply. In a sell order the sub-solver promises to deliver tokens. In a buy order the promise is to consume fewer tokens. BYOS has no mechanism to source the extra tokens (those not priced into the clearing price) for the sub-solver. A sub-solver who wants loose slippage on buy orders must pre-fund their Trampoline instance with buffer tokens. The validation envelope hard-rejects any buy-order proposal where `minBuyAmount != quoteBuyAmount`.
 
 **Partially fillable orders** follow the same rules. The envelope validates `minBuyAmount` and `quoteBuyAmount` against the proportionally scaled limit price.
 
@@ -383,7 +383,7 @@ Eip712Domain {
 }
 ```
 
-**Amounts are raw pre-fee quotes.** `sellAmount` is the route's consumption; the fee wedge the user pays on top stays in the settlement and is never forwarded. `minBuyAmount` is the on-chain floor, enforced by the balance-delta check ([`#order-flow`](#order-flow)). `quoteBuyAmount` is the clearing-price commitment — the amount BYOS uses for scoring, gas-cut sizing, and settlement encoding. When both are equal, the behavior is a fixed-amount proposal. When `minBuyAmount` is lower, the sub-solver opts into a loose buffer on sell orders ([`#order-flow`](#order-flow)). Disputes compare on-chain outcomes against the signed amounts after applying the driver's deterministic fee shift ([`#gas`](#gas)).
+**Amounts are raw pre-fee quotes.** `sellAmount` is the route's consumption; the fee wedge the user pays on top stays in the settlement and is never forwarded. `minBuyAmount` is the on-chain floor, enforced by the balance-delta check ([`#order-flow`](#order-flow)). `quoteBuyAmount` is the clearing-price commitment — the amount BYOS uses for scoring, gas-cut sizing, and settlement encoding. When both are equal, the behavior is a fixed-amount proposal. When `minBuyAmount` is lower, the sub-solver opts into loose slippage on sell orders ([`#order-flow`](#order-flow)). Disputes compare on-chain outcomes against the signed amounts after applying the driver's deterministic fee shift ([`#gas`](#gas)).
 
 **`interactionsHash` is required.** Without it, BYOS could substitute different interactions while presenting the same signed amounts, then blame the sub-solver for the resulting revert. The Trampoline verifies `keccak256(abi.encode(interactions)) == interactionsHash` before executing, so substituted interactions fail signature verification. This differs from CoW order signatures, which do not sign interactions, because the threat model is inverted: sub-solvers need protection against the operator, not against the execution path.
 
@@ -576,7 +576,7 @@ Before simulating, the order and proposal pair must pass a cheap envelope check 
 - `erc20` balance flavors only; external and internal balance orders are rejected.
 - Amounts consistent with the order kind:
   - **Sell order (fill-or-kill):** `proposal.sellAmount == order.sellAmount`. The buy-amount envelope enforces `order.buyAmount <= proposal.minBuyAmount <= proposal.quoteBuyAmount`, and `proposal.quoteBuyAmount` must beat the order's limit price.
-  - **Buy order (fill-or-kill):** `proposal.minBuyAmount == proposal.quoteBuyAmount == order.buyAmount`. A buy-order proposal where `minBuyAmount != quoteBuyAmount` is hard-rejected — the loose buffer does not apply to buy orders ([`#order-flow`](#order-flow)).
+  - **Buy order (fill-or-kill):** `proposal.minBuyAmount == proposal.quoteBuyAmount == order.buyAmount`. A buy-order proposal where `minBuyAmount != quoteBuyAmount` is hard-rejected — loose slippage does not apply to buy orders ([`#order-flow`](#order-flow)).
   - **Partially fillable (sell):** `0 < proposal.sellAmount <= order.sellAmount`. The limit-price check and the `order.buyAmount <= minBuyAmount <= quoteBuyAmount` constraint apply against proportionally scaled amounts.
   - **Partially fillable (buy):** `proposal.minBuyAmount == proposal.quoteBuyAmount`. The limit-price check applies against scaled amounts.
 
@@ -747,7 +747,7 @@ Track A is BYOS-unilateral because for reverts and deadline misses everything is
 
 ### Post-settlement buffer accounting
 
-When a proposal uses a loose buffer (`minBuyAmount < quoteBuyAmount`) and the settlement succeeds, the difference between the clearing-price commitment and the actual delivery must be accounted for. This is not a penalty — it mirrors the charge or credit that CoW applies to BYOS for the same settlement.
+When a proposal uses loose slippage (`minBuyAmount < quoteBuyAmount`) and the settlement succeeds, the difference between the clearing-price commitment and the actual delivery must be accounted for. This is not a penalty — it mirrors the charge or credit that CoW applies to BYOS for the same settlement.
 
 | Delivery vs ceiling | Ledger entry | Sign |
 |---|---|---|
