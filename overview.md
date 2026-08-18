@@ -91,7 +91,7 @@ A proposal can be rejected at multiple stages. Here is every reason, consolidate
 | Proposal expired | `validUntil` is already in the past |
 | Lifetime exceeded | `validUntil` is more than 5 minutes in the future (configurable) |
 | Rate limited | IP or signer rate limit exceeded |
-| Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
+| Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Applies to proposal submission only, so a sub-solver whose withdrawal is pending can still read and cancel what it has live. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
 
 ### At validation (asynchronous, recorded on the proposal)
 

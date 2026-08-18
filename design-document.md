@@ -394,7 +394,7 @@ Proposals are immutable, so there is no update operation and no `PUT`. Replaceme
 
 That means a `2xx` from `POST` is not acceptance. Integration code that treats it as acceptance is wrong. Verdict latency is bounded by the validator tick interval, not by the request round-trip.
 
-**Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and a signer known to be below the minimum escrow is rejected once a balance is known. An address the service has not seen before is admitted at the lowest tier rather than rejected, since absence of a cached balance is not evidence of an empty one. The escrow balance behind the second layer is cached so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
+**Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and a signer known to be below the minimum escrow is rejected once a balance is known. That rejection applies to submission only: effective escrow balance reads as zero from the moment a sub-solver requests a withdrawal, so gating reads and cancellations too would leave a sub-solver winding down unable to cancel, or even see, the proposals it still has live. An address the service has not seen before is admitted at the lowest tier rather than rejected, since absence of a cached balance is not evidence of an empty one. The escrow balance behind the second layer is cached so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
 
 The reject-early pipeline, split across the sync and async boundary:
 
@@ -404,7 +404,7 @@ The reject-early pipeline, split across the sync and async boundary:
 | 2 | Parse + `ecrecover` | request path |
 | 3 | Expiry-window check | request path |
 | 4 | Signer rate limit | request path |
-| 5 | Cached escrow floor gate | request path |
+| 5 | Cached escrow floor gate (submission only) | request path |
 | 6 | Authoritative escrow balance check (RPC) | background validator |
 | 7 | Gatekeeping + simulation | background validator |
 
