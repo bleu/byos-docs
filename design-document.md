@@ -394,19 +394,21 @@ Proposals are immutable, so there is no update operation and no `PUT`. Replaceme
 
 That means a `2xx` from `POST` is not acceptance. Integration code that treats it as acceptance is wrong. Verdict latency is bounded by the validator tick interval, not by the request round-trip.
 
-**Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit plus a service-wide ceiling sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and signers below the minimum escrow are rejected outright. The escrow balance behind the second layer is cached with a short TTL so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
+**Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and a signer known to be below the minimum escrow is rejected once a balance is known. An address the service has not seen before is admitted at the lowest tier rather than rejected, since absence of a cached balance is not evidence of an empty one. The escrow balance behind the second layer is cached so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
 
 The reject-early pipeline, split across the sync and async boundary:
 
 | # | Stage | Where |
 |---|---|---|
-| 1 | IP filter | request path |
+| 1 | IP filter | edge (CDN), with a loose in-app backstop |
 | 2 | Parse + `ecrecover` | request path |
 | 3 | Expiry-window check | request path |
 | 4 | Signer rate limit | request path |
-| 5 | Cached escrow tier check (in-memory) | request path |
+| 5 | Cached escrow floor gate | request path |
 | 6 | Authoritative escrow balance check (RPC) | background validator |
 | 7 | Gatekeeping + simulation | background validator |
+
+Stage 1 sits at the edge because a request rejected there costs no socket, no `ecrecover`, and no connection-pool slot. That depends on the origin being unreachable except through the CDN; otherwise the forwarded client-IP header is attacker-controlled and anything keyed on it is poisoned. The in-app backstop defends against that misconfiguration, not against an attacker who beat the edge.
 
 **Two listeners, one process.** A public port serves `/proposals`; a firewalled internal port serves `/solve` and `/notify`. They never share a socket, because their trust boundaries are opposite: the proposal API must be internet-reachable, while a `/solve` response is the full standing proposal book for an auction — amounts, routes, and signatures, all MEV-relevant. Origin is enforced by network topology rather than path obscurity; an optional bearer token on `/solve` is defense in depth, not a replacement. The split also prevents public traffic from starving the latency-critical path.
 

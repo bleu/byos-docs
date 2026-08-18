@@ -136,11 +136,24 @@ To cancel a proposal before it settles, send a signed `DELETE` request. Proposal
 |---|---|---|
 | Rejected at gatekeeping | None | Read the typed rejection reason. Fix the route or the amounts. |
 | Simulation reverted | None (one rate-limit slot used) | The proposal is dropped on the first revert. There are no retries. Resubmit if the route is still valid. |
+| `429` rate limited | None | You are over your budget. Wait out `Retry-After`. Deposit more escrow for a larger budget. |
+| `503` service unavailable | None | A BYOS dependency is down. Wait out `Retry-After` and retry; nothing was lost. |
+| `403` insufficient escrow | None | Your cached balance is below the minimum collateral. Deposit more. |
 | Expired | None | Your `validUntil` passed. Use a shorter interval. |
 | Lost the auction | None | Your proposal stays live and competes in the next auction. |
 | Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
 | BYOS won but did not settle | Smaller Track A debit | Same dispute window and grounds. |
 | CoW raised an EBBO or fairness claim | [Track B](../design-document#track-b) passthrough | BYOS freezes your balance and sends you the certificate and evidence. |
+
+### Rate limits: `429` and `503`
+
+Your requests share one budget across `POST`, `GET` and `DELETE`, scaled by your escrow balance. A larger deposit buys more throughput. Size your polling against the budget, not against the tick interval: polling every live proposal on a short tick is what consumes it, and writes are cheap by comparison.
+
+A `429` means you exceeded that budget, or the per-IP limit in front of it. A `503` means a store BYOS depends on is unreachable — infrastructure, not load. The two are deliberately separate so you can tell them apart in your own logs.
+
+Both carry a `Retry-After` header, in seconds. Honour it. The reference clients do not, and that is a limitation of the examples rather than a pattern to copy: a client that retries at full rate through a `429` gets nothing back sooner and keeps its own counter pinned.
+
+A `403` with `InsufficientEscrow` on submission means BYOS has a cached balance for your address that is below the minimum collateral. Deposit more; the gate clears within one refresh interval. An address BYOS has not seen before is not rejected — it is admitted at the lowest rate tier.
 
 ### Simulation failures
 
