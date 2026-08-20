@@ -99,7 +99,7 @@ If your route does not explicitly forward sell tokens before the sweep, you can 
 
 ## 5. Sign the proposal
 
-Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). The `ProposalData` struct has seven fields: `orderUidHash`, `sellAmount`, `minBuyAmount`, `quoteBuyAmount`, `interactionsHash`, `validUntil`, `nonce`. Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
+Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). The `ProposalData` struct has nine fields: `orderUidHash`, `sellToken`, `buyToken`, `sellAmount`, `minBuyAmount`, `quoteBuyAmount`, `interactionsHash`, `validUntil`, `nonce`. Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
 
 The API verifies your signature at submission. The Trampoline verifies the same signature on-chain at settlement. If the two do not match, the settlement fails.
 
@@ -194,7 +194,7 @@ The protocol is language-neutral. Use either example for the sequence, the EIP-7
 Before you go live, make sure that:
 
 - [ ] You funded the Escrow above the minimum. A deposit also deploys your Trampoline.
-- [ ] You verified your EIP-712 hashes against the contract's test vectors (not your own derivation). The struct has seven fields.
+- [ ] You verified your EIP-712 hashes against the contract's test vectors (not your own derivation). The struct has nine fields.
 - [ ] Your domain configuration points to the correct chain and contracts generation.
 - [ ] Your `validUntil` value is within the ingestion cap.
 - [ ] Your route leaves headroom above the user's limit for the gas cut and the driver's fee shift.
