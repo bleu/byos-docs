@@ -528,6 +528,42 @@ Transitions are compare-and-swap. Zero rows affected means the caller's verdict 
 
 **Terminal retention has one knob.** Rejected, sim-failed, expired, and cancelled rows are deleted an hour after reaching the state; consumers are polling loops that observe a terminal state within one interval, and after that the proposal is a 404. The money states — settled, settle-failed, penalized — are kept indefinitely, with no sweep code at all. `audit_events` has no deletion path.
 
+### Rejection reference
+
+Every reason a proposal stops competing, grouped by when it happens:
+
+**At submission (synchronous, immediate 4xx)**
+
+| Reason | Meaning |
+|---|---|
+| Invalid signature | Malformed signature hex or recovery failure |
+| Proposal expired | `validUntil` is already in the past |
+| Lifetime exceeded | `validUntil` is more than 5 minutes in the future (configurable) |
+| Rate limited | IP or signer rate limit exceeded |
+| Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Applies to proposal submission only, so a sub-solver whose withdrawal is pending can still read and cancel what it has live. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
+
+**At validation (asynchronous, recorded on the proposal)**
+
+| Reason | Meaning |
+|---|---|
+| Insufficient escrow | Balance below the threshold (`gas estimate × gas price + minimum collateral`) |
+| Order not found | Order UID not in CoW's orderbook (filled, expired, or cancelled) |
+| Unsupported order | Non-ERC20 balance flavors, bridging orders, or (in v1) partially fillable orders |
+| Amount mismatch | Proposal amounts don't match the order (fill-or-kill mismatch, or partial fill violates limits) |
+| Unprofitable | Score (`surplus - gas`) is zero or negative on first simulation |
+| Simulation failed | The full settlement simulation reverted — terminal on first occurrence, no retries |
+
+**By lifecycle (not a rejection, but the proposal stops competing)**
+
+| State | Cause |
+|---|---|
+| Expired | `validUntil` passed |
+| Cancelled | Sub-solver sent a signed `DELETE` |
+| Settled | The proposal won an auction and settled on-chain |
+| Settle failed | Settlement reverted on-chain — triggers a Track A penalty |
+
+Simulation failures are free: only on-chain failures touch escrow.
+
 ### Settlement outcomes
 
 Outcomes come from the stock CoW driver's `/notify` protocol. There is no chain watcher and no driver fork.
