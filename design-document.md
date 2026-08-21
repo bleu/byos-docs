@@ -128,12 +128,11 @@ sequenceDiagram
     D->>S: settle(batch)
     S->>S: pull user sellAmount into Settlement
     S->>T: sellToken.transfer(trampoline, sellAmount)
-    S->>T: execute(proposal, route, sellToken, buyToken, signature)
+    S->>T: execute(proposal, route, signature)
     T->>T: onlySettlement + submitter + validUntil + signature checks
-    T->>T: record Settlement's buyToken balance
+    T->>T: record Settlement's buyToken balance (from proposal)
     T->>R: run route interactions
     R-->>T: buyToken produced (>= minBuyAmount)
-    T->>S: sweep full buyToken + sellToken balances
     T->>T: assert Settlement buyToken delta >= minBuyAmount
     S->>S: transferToAccounts pays the user
     S-->>D: settle() succeeds
@@ -156,11 +155,10 @@ sequenceDiagram
 
     D->>S: settle(batch)
     S->>T: sellToken.transfer(trampoline, sellAmount)
-    S->>T: execute(proposal, route, sellToken, buyToken, signature)
-    T->>T: record Settlement's buyToken balance
+    S->>T: execute(proposal, route, signature)
+    T->>T: record Settlement's buyToken balance (from proposal)
     T->>R: run route interactions
     R-->>T: buyToken produced (< minBuyAmount)
-    T->>S: sweep full buyToken + sellToken balances
     T--xT: delta check fails: balance grew less than minBuyAmount
     S--xD: settle() reverts, no state change
     Note over D: buffer never net-drained,<br/>sub-solver eats the Track A debit
@@ -181,10 +179,9 @@ sequenceDiagram
     D->>S: settle(batch)
     S->>S: pull user's executed sell amount<br/>(fee wedge included, stays in Settlement)
     S->>T: sellToken.transfer(trampoline, sellAmount) — raw signed input
-    S->>T: execute(proposal, route, sellToken, buyToken, signature)
+    S->>T: execute(proposal, route, signature)
     T->>R: run route: consumes part of the input
     R-->>T: buyToken produced (>= minBuyAmount)
-    T->>S: sweep: all buyToken + unconsumed sellToken
     T->>T: assert Settlement buyToken delta >= minBuyAmount
     S->>S: transferToAccounts pays the user exactly buyAmount
     S-->>D: settle() succeeds
@@ -365,9 +362,11 @@ The EIP-712 typed data a sub-solver signs. This struct is verified twice: by the
 ```solidity
 struct ProposalData {
     bytes32 orderUidHash;      // keccak256(order_uid) — ties to a specific order
+    address sellToken;         // the trade's sell token, signed to prevent cross-pair reuse
+    address buyToken;          // the trade's buy token, used for the balance-delta check
     uint256 sellAmount;        // route consumption the instance receives (raw, pre-fee)
     uint256 minBuyAmount;      // floor: minimum buy-token delta the contract enforces on-chain
-    uint256 quoteBuyAmount;      // ceiling: clearing-price commitment used for scoring and settlement encoding
+    uint256 quoteBuyAmount;    // ceiling: clearing-price commitment used for scoring and settlement encoding
     bytes32 interactionsHash;  // keccak256(abi.encode(interactions)) — the route
     uint256 validUntil;        // expiry timestamp
     uint256 nonce;             // unique salt for signature uniqueness
@@ -408,7 +407,7 @@ The public HTTP surface by which sub-solvers submit signed proposals. Field-leve
 | `GET /buffer-balance` | The caller's outstanding buffer balance, clearing threshold, and per-proposal entries. |
 | `DELETE /proposal/{id}` | Cancellation by the original signer. |
 
-`POST` does not carry token addresses. The orderbook order is the single source of truth for them, which removes a lying-client hazard.
+`POST` carries `sellToken` and `buyToken` because they are part of the EIP-712 signed struct. The service validates them against the orderbook order during proposal validation.
 
 **The recovered signer is the identity.** There are no API keys, sessions, or accounts. Callers are sub-solver servers over TLS, not browsers.
 
@@ -679,7 +678,7 @@ Because BYOS returns one proposal per order, there is no fallback if the selecte
 Each selected proposal becomes exactly two intra-settlement interactions:
 
 1. `sellToken.transfer(trampoline, sellAmount)` — BYOS-authored. Pushes trade capital from `GPv2Settlement` into the instance. The Trampoline cannot reach settlement funds itself, so this is mandatory.
-2. `trampoline.execute(proposal, interactions, sellToken, buyToken, signature)` — runs the signed route inside the sandbox. Everything inside that call is contract behaviour ([`#trampoline`](#trampoline)). Token addresses are BYOS-supplied call parameters taken from the order, not signed proposal fields.
+2. `trampoline.execute(proposal, interactions, signature)` — runs the signed route inside the sandbox. Everything inside that call is contract behaviour ([`#trampoline`](#trampoline)). Both trade token addresses are signed proposal fields (bound into the EIP-712 struct hash), preventing a signature from being reused with an unrelated token pair.
 
 The engine computes the CREATE2 address from the recovered sub-solver address and ABI-encodes both calls. That is keccak256 and ABI encoding — pure local computation, no RPC on the hot path.
 

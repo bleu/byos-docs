@@ -140,8 +140,6 @@ A per-sub-solver execution sandbox. Receives the sell token, runs the sub-solver
 function execute(
     Proposal calldata _proposal,
     Interaction[] calldata _interactions,
-    address _sellToken,
-    address _buyToken,
     bytes calldata _signature
 ) external
 ```
@@ -151,7 +149,7 @@ Only callable when all gates pass:
 2. `tx.origin` holds `SUBMITTER_ROLE` on the Escrow — must be BYOS's submitter, not a rival solver replaying public calldata.
 3. `block.timestamp <= proposal.validUntil` — proposal not expired.
 4. `proposal.nonce` not previously used — replay protection.
-5. EIP-712 signature over `ProposalData + interactionsHash` recovers to `SUB_SOLVER` — proves the sub-solver consented to this exact route.
+5. EIP-712 signature over `ProposalData + interactionsHash` recovers to `SUB_SOLVER` — proves the sub-solver consented to this exact route and token pair.
 
 Then:
 1. Records `GPv2Settlement`'s current buy-token balance.
