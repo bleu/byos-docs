@@ -438,19 +438,21 @@ Proposals are immutable, so there is no update operation and no `PUT`. Replaceme
 
 That means a `2xx` from `POST` is not acceptance. Integration code that treats it as acceptance is wrong. Verdict latency is bounded by the validator tick interval, not by the request round-trip.
 
-**Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit plus a service-wide ceiling sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and signers below the minimum escrow are rejected outright. The escrow balance behind the second layer is cached with a short TTL so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
+**Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and a signer known to be below the minimum escrow is rejected once a balance is known. That rejection applies to submission only: effective escrow balance reads as zero from the moment a sub-solver requests a withdrawal, so gating reads and cancellations too would leave a sub-solver winding down unable to cancel, or even see, the proposals it still has live. An address the service has not seen before is admitted at the lowest tier rather than rejected, since absence of a cached balance is not evidence of an empty one. The escrow balance behind the second layer is cached so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
 
 The reject-early pipeline, split across the sync and async boundary:
 
 | # | Stage | Where |
 |---|---|---|
-| 1 | IP filter | request path |
+| 1 | IP filter | edge (CDN), with a loose in-app backstop |
 | 2 | Parse + `ecrecover` | request path |
 | 3 | Expiry-window check | request path |
 | 4 | Signer rate limit | request path |
-| 5 | Cached escrow tier check (in-memory) | request path |
+| 5 | Cached escrow floor gate (submission only) | request path |
 | 6 | Authoritative escrow balance check (RPC) | background validator |
 | 7 | Gatekeeping + simulation | background validator |
+
+Stage 1 sits at the edge because a request rejected there costs no socket, no `ecrecover`, and no connection-pool slot. That depends on the origin being unreachable except through the CDN; otherwise the forwarded client-IP header is attacker-controlled and anything keyed on it is poisoned. The in-app backstop defends against that misconfiguration, not against an attacker who beat the edge.
 
 **Two listeners, one process.** A public port serves `/proposals`; a firewalled internal port serves `/solve` and `/notify`. They never share a socket, because their trust boundaries are opposite: the proposal API must be internet-reachable, while a `/solve` response is the full standing proposal book for an auction — amounts, routes, and signatures, all MEV-relevant. Origin is enforced by network topology rather than path obscurity; an optional bearer token on `/solve` is defense in depth, not a replacement. The split also prevents public traffic from starving the latency-critical path.
 
@@ -525,6 +527,42 @@ Every transition:
 Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a cancellation or a notification won the race.
 
 **Terminal retention has one knob.** Rejected, sim-failed, expired, and cancelled rows are deleted an hour after reaching the state; consumers are polling loops that observe a terminal state within one interval, and after that the proposal is a 404. The money states — settled, settle-failed, penalized — are kept indefinitely, with no sweep code at all. `audit_events` has no deletion path.
+
+### Rejection reference
+
+Every reason a proposal stops competing, grouped by when it happens:
+
+**At submission (synchronous, immediate 4xx)**
+
+| Reason | Meaning |
+|---|---|
+| Invalid signature | Malformed signature hex or recovery failure |
+| Proposal expired | `validUntil` is already in the past |
+| Lifetime exceeded | `validUntil` is more than 5 minutes in the future (configurable) |
+| Rate limited | IP or signer rate limit exceeded |
+| Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Applies to proposal submission only, so a sub-solver whose withdrawal is pending can still read and cancel what it has live. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
+
+**At validation (asynchronous, recorded on the proposal)**
+
+| Reason | Meaning |
+|---|---|
+| Insufficient escrow | Balance below the threshold (`gas estimate × gas price + minimum collateral`) |
+| Order not found | Order UID not in CoW's orderbook (filled, expired, or cancelled) |
+| Unsupported order | Non-ERC20 balance flavors, bridging orders, or (in v1) partially fillable orders |
+| Amount mismatch | Proposal amounts don't match the order (fill-or-kill mismatch, or partial fill violates limits) |
+| Unprofitable | Score (`surplus - gas`) is zero or negative on first simulation |
+| Simulation failed | The full settlement simulation reverted — terminal on first occurrence, no retries |
+
+**By lifecycle (not a rejection, but the proposal stops competing)**
+
+| State | Cause |
+|---|---|
+| Expired | `validUntil` passed |
+| Cancelled | Sub-solver sent a signed `DELETE` |
+| Settled | The proposal won an auction and settled on-chain |
+| Settle failed | Settlement reverted on-chain — triggers a Track A penalty |
+
+Simulation failures are free: only on-chain failures touch escrow.
 
 ### Settlement outcomes
 
