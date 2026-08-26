@@ -51,10 +51,10 @@ The CoW driver notifies BYOS of outcomes via `POST /notify`. There is no chain w
 
 | Notification | Proposal transition |
 |---|---|
-| `SettlementStarted` | `Active` → `Executing` |
-| `Success { transaction }` | `Active` or `Executing` → `Settled` |
-| `Revert { transaction }` | `Active` or `Executing` → `SettleFailed` (triggers Track A debit) |
-| `Cancelled` / `Expired` / `Fail` | `Executing` → `Active` (queues non-settlement debit) |
+| `SettlementStarted` | `Active` or `Superseded` → `Executing` |
+| `Success { transaction }` | `Active`, `Executing`, or `Superseded` → `Settled` |
+| `Revert { transaction }` | `Active`, `Executing`, or `Superseded` → `SettleFailed` (triggers Track A debit) |
+| `Cancelled` / `Expired` / `Fail` | `Executing` → its recorded prior state, `Active` or `Superseded` (queues non-settlement debit) |
 
 `/notify` joins to proposals through the `(auction_id, solution_id, proposal_id)` mapping that `/solve` records synchronously before returning solutions.
 
@@ -66,8 +66,8 @@ Three background loops run alongside the HTTP listeners:
 
 Runs every ~12 seconds (one block):
 
-1. **Release stale executing proposals** — proposals stuck in `Executing` for more than 5 minutes (lost notification or restart) fall back to `Active`.
-2. **Expire proposals** — any `Submitted` or `Active` proposal with `validUntil < now` transitions to `Expired`.
+1. **Release stale executing proposals** — proposals stuck in `Executing` for more than 5 minutes (lost notification or restart) return to their prior live state: `Active` or `Superseded`.
+2. **Expire proposals** — any `Submitted`, `Active`, or `Superseded` proposal with `validUntil < now` transitions to `Expired`.
 3. **Validate remaining proposals** — for each `Submitted` or `Active` proposal:
    - **Escrow check** (cheap): `effectiveBalance(subSolver) >= ESCROW_GAS_ESTIMATION × gas_price + min_collateral`, where `ESCROW_GAS_ESTIMATION` is a fixed 200k gas floor. Reject if insufficient.
    - **Order envelope check** (no RPC): ERC20 balances only, no bridging orders, amounts consistent with order kind. For sell orders: `order.buyAmount <= minBuyAmount <= quoteBuyAmount`, `quoteBuyAmount` beats the limit price. For buy orders: `minBuyAmount == quoteBuyAmount == order.buyAmount` (hard-reject otherwise). Partially fillable orders use the same constraints against scaled amounts.
@@ -102,15 +102,22 @@ stateDiagram-v2
     Active --> SimFailed: re-simulation reverts
     Active --> Rejected: escrow re-check fails
     Active --> Executing: driver SettlementStarted
+    Submitted --> Superseded: newer proposal activates
+    Active --> Superseded: newer proposal activates
+    Superseded --> Executing: delayed SettlementStarted
+    Superseded --> Settled: delayed Success
+    Superseded --> SettleFailed: delayed Revert
     Submitted --> Expired: validUntil passed
     Active --> Expired: validUntil passed
+    Superseded --> Expired: validUntil passed
     Submitted --> Cancelled: DELETE
     Active --> Cancelled: DELETE
     Active --> Settled: driver Success\n(missed Started)
     Active --> SettleFailed: driver Revert\n(missed Started)
     Executing --> Settled: driver Success
     Executing --> SettleFailed: driver Revert
-    Executing --> Active: driver Cancelled/Fail,\nor timeout
+    Executing --> Active: driver Cancelled/Fail,\nor timeout (was Active)
+    Executing --> Superseded: driver Cancelled/Fail,\nor timeout (was Superseded)
     SettleFailed --> Penalized: Track A debit lands
 ```
 
@@ -120,11 +127,16 @@ A state answers one question: **what does the service do with this proposal righ
 |---|---|---|---|
 | `Submitted` | First pass pending | No | Yes |
 | `Active` | Every tick | Yes | Yes |
+| `Superseded` | No | No | No |
 | `Executing` | No | No | No |
 | `Rejected` / `SimFailed` / `Expired` / `Cancelled` | No | No | No |
 | `Settled` / `SettleFailed` / `Penalized` | No | No | No |
 
-Transitions are **compare-and-swap** — zero rows affected means the caller's verdict was stale (a cancellation or notification won the race).
+`POST /proposals` uses `(subSolver, nonce)` as its idempotency key. An identical signed replay returns the original id with `202` and has no side effects; different signed content for the same key returns `409 NonceAlreadyUsed`.
+
+When a proposal is still the newest eligible submission and validates, one serialized group transaction activates it and supersedes older `Submitted` or `Active` proposals for the same `(subSolver, orderUid)`. It records `supersededByProposalId`, never supersedes `Executing`, and prevents a late older validator from reactivating stale work. Superseded proposals are excluded from validation and `/solve`, but continue to expire. A delayed notification for a previously offered superseded proposal is accepted: abandonment restores `Superseded`; success and revert stay terminal.
+
+Transitions are **compare-and-swap** — zero rows affected means the caller's verdict was stale (a cancellation, replacement, or notification won the race).
 
 ## Persistence
 

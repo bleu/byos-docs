@@ -125,7 +125,7 @@ All endpoints are on the public listener (default port 9585):
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `202` with an id. This is **not** acceptance. |
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `202` with an id. Replaying identical signed content returns the original id; reusing its nonce with different signed content returns `409 NonceAlreadyUsed`. This is **not** acceptance. |
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. |
@@ -152,7 +152,7 @@ Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended opera
 
 ### Cancel a proposal
 
-To cancel a proposal before it settles, send a signed `DELETE` request. Proposals are immutable. There is no update operation. To replace a proposal, cancel it and submit a new one.
+To cancel a proposal before it settles, send a signed `DELETE` request. Proposals are immutable and there is no update operation. To replace one, submit a new proposal with a new nonce: when it validates, BYOS supersedes your older submitted or active proposals for that order. Do not cancel first; the old proposal remains usable until the replacement becomes active.
 
 ## 7. Error handling
 
@@ -162,6 +162,7 @@ To cancel a proposal before it settles, send a signed `DELETE` request. Proposal
 | Simulation reverted | None (one rate-limit slot used) | The proposal is dropped on the first revert. There are no retries. Resubmit if the route is still valid. |
 | `429` rate limited | None | You are over your budget. Wait out `Retry-After`. Deposit more escrow for a larger budget. |
 | `503` service unavailable | None | A BYOS dependency is down. Wait out `Retry-After` and retry; nothing was lost. |
+| `409 NonceAlreadyUsed` | None | The nonce was already used for different signed content. Generate a new nonce; retrying the exact same signed proposal is safe and returns its original id. |
 | `403` insufficient escrow | None | Your cached balance is below the minimum collateral. Deposit more. Submission only — reads and cancellations keep working. |
 | Expired | None | Your `validUntil` passed. Use a shorter interval. |
 | Lost the auction | None | Your proposal stays live and competes in the next auction. |
