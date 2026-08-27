@@ -431,7 +431,7 @@ struct CancelProposal {
 }
 ```
 
-Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Once the newer proposal validates, it supersedes the caller's older `Submitted` and `Active` proposals for the same order.
+Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Once the newer proposal validates, it cancels the caller's older `Submitted` and `Active` proposals for the same order.
 
 **Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `202 Accepted` and creates no row, audit event, or replacement. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, so there is no unsigned replacement-intent field.
 
@@ -475,20 +475,15 @@ stateDiagram-v2
     Active --> SimFailed: re-simulation reverts
     Active --> Rejected: escrow re-check fails
     Active --> Executing: driver SettlementStarted
-    Submitted --> Superseded: newer proposal activates
-    Active --> Superseded: newer proposal activates
-    Superseded --> Executing: delayed driver SettlementStarted
-    Superseded --> Settled: delayed driver Success
-    Superseded --> SettleFailed: delayed driver Revert
+    Submitted --> Cancelled: newer proposal activates
+    Active --> Cancelled: newer proposal activates
     Submitted --> Expired: validUntil passed
     Active --> Expired: validUntil passed
-    Superseded --> Expired: validUntil passed
     Submitted --> Cancelled: DELETE /proposals/{id}
     Active --> Cancelled: DELETE /proposals/{id}
     Executing --> Settled: driver Success
     Executing --> SettleFailed: driver Revert
-    Executing --> Active: driver Cancelled/Expired/Fail,\nor executing timeout (was Active)
-    Executing --> Superseded: driver Cancelled/Expired/Fail,\nor executing timeout (was Superseded)
+    Executing --> Active: driver Cancelled/Expired/Fail,\nor executing timeout
     SettleFailed --> Penalized: Track A escrow debit lands
     Settled --> [*]
     Penalized --> [*]
@@ -500,7 +495,6 @@ A state answers exactly one question: what does the service do with this proposa
 |---|---|---|---|---|---|
 | `Submitted` | first pass | no | yes | yes | live |
 | `Active` | every tick | yes | yes | yes | live |
-| `Superseded` | no | no | yes | no | live |
 | `Executing` | no | no | no | no | live |
 | `Rejected` | no | no | — | no | 1 hour |
 | `SimFailed` | no | no | — | no | 1 hour |
@@ -521,20 +515,19 @@ Every transition:
 | `Active` | `Active` | Re-validation tick refreshes the gas estimate. No status change, no audit event. |
 | `Active` | `Rejected` | Escrow re-check fails; the balance dropped below the threshold. |
 | `Active` | `SimFailed` | Re-simulation reverts: the order filled or expired on-chain, the route broke, balances moved. |
-| `Submitted`, `Active` | `Superseded` | A newer proposal for the same `(subSolver, orderUid)` validates and activates. Records `supersededByProposalId`. |
-| `Submitted`, `Active`, `Superseded` | `Expired` | `validUntil` is behind the clock. |
-| `Submitted`, `Active` | `Cancelled` | Signed `DELETE` by the owner. `DELETE` against any other state is a 409. |
-| `Active`, `Superseded` | `Executing` | Driver `SettlementStarted`: our solution won and the transaction is being submitted. This accepts delayed notifications for a proposal returned before it was superseded. |
+| `Submitted`, `Active` | `Expired` | `validUntil` is behind the clock. |
+| `Submitted`, `Active` | `Cancelled` | Signed `DELETE` by the owner, or a newer proposal for the same `(subSolver, orderUid)` validates and activates. `DELETE` against any other state is a 409. |
+| `Active` | `Executing` | Driver `SettlementStarted`: our solution won and the transaction is being submitted. |
 | `Executing` | `Settled` | Driver `Success`. Transaction hash recorded. |
 | `Executing` | `SettleFailed` | Driver `Revert`. Transaction hash recorded; the Track A debit follows. |
-| `Executing` | `Active`, `Superseded` | Driver `Cancelled`, `Expired`, or `Fail` (submission abandoned, no transaction landed), or the executing timeout elapsed. Returns to its pre-execution live state, recorded so a superseded proposal remains superseded; queues the non-settlement debit. |
+| `Executing` | `Active` | Driver `Cancelled`, `Expired`, or `Fail` (submission abandoned, no transaction landed), or the executing timeout elapsed. Queues the non-settlement debit. |
 | `SettleFailed` | `Penalized` | The Track A escrow debit lands on-chain. Penalty transaction hash recorded. |
 
 **Losing an auction is not a state.** A proposal outscored internally, or whose solution lost the external competition, is still valid and keeps competing. Participation is recorded as data, so "which auctions did this compete in and lose" is a query, not a status. Winning *is* a state change, because it changes what the service does: it must stop offering the proposal and stop re-simulating it.
 
-**Supersession is an activation-time, atomic group transition.** A successfully validated proposal becomes `Active` only if it is still the newest eligible submission for its `(subSolver, orderUid)` group. In that same serialized transaction, it changes every older `Submitted` or `Active` proposal in the group to `Superseded` and records its id as `supersededByProposalId`; `Executing` proposals are unchanged. This ordering prevents an older validator job from replacing or reactivating a newer proposal. Superseded proposals are neither simulated nor returned by `/solve`, but still expire normally.
+**Replacement is an activation-time, atomic group transition.** A successfully validated proposal becomes `Active` only if it is still the newest eligible submission for its `(subSolver, orderUid)` group. In that same serialized transaction, it changes every older `Submitted` or `Active` proposal in the group to `Cancelled`; `Executing` proposals are unchanged. This ordering prevents an older validator job from replacing or reactivating a newer proposal.
 
-`Executing` is entered on `SettlementStarted`, not at `/solve` time, because at `/solve` time we do not yet know we won. A notification can arrive after its proposal was superseded, so `Superseded` may also enter `Executing`. It is exempt from the expiry sweep on purpose — the chain enforces the order's real deadline. An abandoned execution returns to the proposal's prior live state: `Active` or `Superseded`. Success and revert remain terminal. Re-simulation is the truth-teller for proposals that return to `Active`.
+`Executing` is entered on `SettlementStarted`, not at `/solve` time, because at `/solve` time we do not yet know we won. It is exempt from the expiry sweep on purpose — the chain enforces the order's real deadline. An abandoned execution returns to `Active`, covering lost notifications and restarts mid-settlement. Success and revert remain terminal. Re-simulation is the truth-teller.
 
 Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a cancellation, replacement, or notification won the race.
 
@@ -572,7 +565,6 @@ Every reason a proposal stops competing, grouped by when it happens:
 |---|---|
 | Expired | `validUntil` passed |
 | Cancelled | Sub-solver sent a signed `DELETE` |
-| Superseded | A newer proposal for the same sub-solver and order activated |
 | Settled | The proposal won an auction and settled on-chain |
 | Settle failed | Settlement reverted on-chain — triggers a Track A penalty |
 
@@ -584,10 +576,10 @@ Outcomes come from the stock CoW driver's `/notify` protocol. There is no chain 
 
 | Notification | Effect |
 |---|---|
-| `SettlementStarted` | `Active` or `Superseded` to `Executing` |
-| `Success { transaction }` | `Executing` or `Superseded` to `Settled` |
-| `Revert { transaction }` | `Executing` or `Superseded` to `SettleFailed`; Track A trigger |
-| `Cancelled`, `Expired`, `Fail` | `Executing` to its pre-execution state (`Active` or `Superseded`); queues the non-settlement debit |
+| `SettlementStarted` | `Active` to `Executing` |
+| `Success { transaction }` | `Executing` to `Settled` |
+| `Revert { transaction }` | `Executing` to `SettleFailed`; Track A trigger |
+| `Cancelled`, `Expired`, `Fail` | `Executing` to `Active`; queues the non-settlement debit |
 | Pre-submission kinds | no transition; recorded as audit events |
 
 Notifications carry auction and solution ids, not proposals, so `/solve` records the `(auction_id, solution_id, proposal_id)` mapping synchronously before returning a solution — if it cannot be recorded, it is not bid. `/notify` joins through that mapping, which doubles as the per-auction participation record. The ids are optional on the wire, so the handler must tolerate notifications it cannot join, but an *outcome* notification that cannot be attributed is an alert-worthy bug.

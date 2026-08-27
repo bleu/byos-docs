@@ -152,7 +152,7 @@ Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended opera
 
 ### Cancel a proposal
 
-To cancel a proposal before it settles, send a signed `DELETE` request. Proposals are immutable and there is no update operation. To replace one, submit a new proposal with a new nonce: when it validates, BYOS supersedes your older submitted or active proposals for that order. Do not cancel first; the old proposal remains usable until the replacement becomes active.
+To cancel a proposal before it settles, send a signed `DELETE` request. Proposals are immutable and there is no update operation. To replace one, submit a new proposal with a new nonce: when it validates, BYOS cancels your older submitted or active proposals for that order. Do not cancel first; the old proposal remains usable until the replacement becomes active.
 
 ## 7. Error handling
 
