@@ -102,6 +102,8 @@ stateDiagram-v2
     Active --> SimFailed: re-simulation reverts
     Active --> Rejected: escrow re-check fails
     Active --> Executing: driver SettlementStarted
+    Submitted --> Cancelled: newer proposal activates
+    Active --> Cancelled: newer proposal activates
     Submitted --> Expired: validUntil passed
     Active --> Expired: validUntil passed
     Submitted --> Cancelled: DELETE
@@ -124,7 +126,11 @@ A state answers one question: **what does the service do with this proposal righ
 | `Rejected` / `SimFailed` / `Expired` / `Cancelled` | No | No | No |
 | `Settled` / `SettleFailed` / `Penalized` | No | No | No |
 
-Transitions are **compare-and-swap** — zero rows affected means the caller's verdict was stale (a cancellation or notification won the race).
+`POST /proposals` uses `(subSolver, nonce)` as its idempotency key. An identical signed replay returns the original id with `202` and has no side effects; different signed content for the same key returns `409 NonceAlreadyUsed`.
+
+When a proposal is still the newest eligible submission and validates, one serialized group transaction activates it and cancels older `Submitted` or `Active` proposals for the same `(subSolver, orderUid)`. It never cancels `Executing` proposals and prevents a late older validator from reactivating stale work.
+
+Transitions are **compare-and-swap** — zero rows affected means the caller's verdict was stale (a cancellation, replacement, or notification won the race).
 
 ## Persistence
 

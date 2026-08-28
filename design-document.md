@@ -431,9 +431,11 @@ struct CancelProposal {
 }
 ```
 
-Proposals are immutable, so there is no update operation and no `PUT`. Replacement is a new `POST`, optionally preceded by a `DELETE`.
+Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Once the newer proposal validates, it cancels the caller's older `Submitted` and `Active` proposals for the same order.
 
-**Ingestion is asynchronous.** The request path does three things inline: parse, `ecrecover`, and check the expiry window. On success the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted". Signature and expiry-window failures reject synchronously with a typed 4xx, since there is no point storing and auditing a proposal that is dead on arrival. All on-chain work, the escrow balance check and simulation, runs in a background validator loop ([`#proposal-lifecycle`](#proposal-lifecycle)). Sub-solvers poll for the verdict, and a rejection carries a machine-readable typed reason.
+**Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `202 Accepted` and creates no row, audit event, or replacement. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, so there is no unsigned replacement-intent field.
+
+**Ingestion is asynchronous.** The request path does three things inline: parse, `ecrecover`, and check the expiry window. On first use of a nonce, the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted". Signature and expiry-window failures reject synchronously with a typed 4xx, since there is no point storing and auditing a proposal that is dead on arrival. All on-chain work, the escrow balance check and simulation, runs in a background validator loop ([`#proposal-lifecycle`](#proposal-lifecycle)). Sub-solvers poll for the verdict, and a rejection carries a machine-readable typed reason.
 
 That means a `2xx` from `POST` is not acceptance. Integration code that treats it as acceptance is wrong. Verdict latency is bounded by the validator tick interval, not by the request round-trip.
 
@@ -473,6 +475,8 @@ stateDiagram-v2
     Active --> SimFailed: re-simulation reverts
     Active --> Rejected: escrow re-check fails
     Active --> Executing: driver SettlementStarted
+    Submitted --> Cancelled: newer proposal activates
+    Active --> Cancelled: newer proposal activates
     Submitted --> Expired: validUntil passed
     Active --> Expired: validUntil passed
     Submitted --> Cancelled: DELETE /proposals/{id}
@@ -512,7 +516,7 @@ Every transition:
 | `Active` | `Rejected` | Escrow re-check fails; the balance dropped below the threshold. |
 | `Active` | `SimFailed` | Re-simulation reverts: the order filled or expired on-chain, the route broke, balances moved. |
 | `Submitted`, `Active` | `Expired` | `validUntil` is behind the clock. |
-| `Submitted`, `Active` | `Cancelled` | Signed `DELETE` by the owner. `DELETE` against any other state is a 409. |
+| `Submitted`, `Active` | `Cancelled` | Signed `DELETE` by the owner, or a newer proposal for the same `(subSolver, orderUid)` validates and activates. `DELETE` against any other state is a 409. |
 | `Active` | `Executing` | Driver `SettlementStarted`: our solution won and the transaction is being submitted. |
 | `Executing` | `Settled` | Driver `Success`. Transaction hash recorded. |
 | `Executing` | `SettleFailed` | Driver `Revert`. Transaction hash recorded; the Track A debit follows. |
@@ -521,9 +525,11 @@ Every transition:
 
 **Losing an auction is not a state.** A proposal outscored internally, or whose solution lost the external competition, is still valid and keeps competing. Participation is recorded as data, so "which auctions did this compete in and lose" is a query, not a status. Winning *is* a state change, because it changes what the service does: it must stop offering the proposal and stop re-simulating it.
 
-`Executing` is entered on `SettlementStarted`, not at `/solve` time, because at `/solve` time we do not yet know we won. It is exempt from the expiry sweep on purpose — the chain enforces the order's real deadline. Two safety properties make the state recoverable: `Executing` to `Active` is always safe, because if the order was actually consumed the next re-simulation reverts and the proposal dies; and an executing timeout returns a stuck proposal to `Active`, covering lost notifications and restarts mid-settlement. Re-simulation is the truth-teller.
+**Replacement is an activation-time, atomic group transition.** A successfully validated proposal becomes `Active` only if it is still the newest eligible submission for its `(subSolver, orderUid)` group. In that same serialized transaction, it changes every older `Submitted` or `Active` proposal in the group to `Cancelled`; `Executing` proposals are unchanged. This ordering prevents an older validator job from replacing or reactivating a newer proposal.
 
-Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a cancellation or a notification won the race.
+`Executing` is entered on `SettlementStarted`, not at `/solve` time, because at `/solve` time we do not yet know we won. It is exempt from the expiry sweep on purpose — the chain enforces the order's real deadline. An abandoned execution returns to `Active`, covering lost notifications and restarts mid-settlement. Success and revert remain terminal. Re-simulation is the truth-teller.
+
+Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a cancellation, replacement, or notification won the race.
 
 **Terminal retention has one knob.** Rejected, sim-failed, expired, and cancelled rows are deleted an hour after reaching the state; consumers are polling loops that observe a terminal state within one interval, and after that the proposal is a 404. The money states — settled, settle-failed, penalized — are kept indefinitely, with no sweep code at all. `audit_events` has no deletion path.
 
@@ -538,6 +544,7 @@ Every reason a proposal stops competing, grouped by when it happens:
 | Invalid signature | Malformed signature hex or recovery failure |
 | Proposal expired | `validUntil` is already in the past |
 | Lifetime exceeded | `validUntil` is more than 5 minutes in the future (configurable) |
+| Nonce already used | This sub-solver used the nonce for different signed content; an exact signed replay is idempotent and returns its original id with `202`. |
 | Rate limited | IP or signer rate limit exceeded |
 | Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Applies to proposal submission only, so a sub-solver whose withdrawal is pending can still read and cancel what it has live. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
 
