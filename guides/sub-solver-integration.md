@@ -12,9 +12,9 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 
 - **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
 - **Order selection.** Find orders in CoW's public orderbook. Compute any route that delivers buy tokens to the GPv2Settlement contract. Assume execution from Trampoline with sell tokens on it.
-- **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into loose slippage — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
+- **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. The safest and recommended option is enforcing `minBuyAmount = quoteBuyAmount`. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into loose slippage — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
 - **Venue-level fees.** If your route goes through a pool you operate, you keep those fees. To capture surplus above your floor, do it inside your route before the sweep.
-- **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade.
+<!-- - **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade. -->
 
 **You are NOT responsible for:**
 
@@ -23,6 +23,24 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 - **Gas estimation or fee calculation.** BYOS sizes the gas cut. The driver applies protocol and partner fees. Your amounts are raw, pre-fee route amounts.
 - **Trampoline contract logic.** The sweep, the floor check, and the sandbox isolation are in the contract code. You cannot change them.
 - **CoW protocol compliance.** BYOS manages the relationship with CoW DAO, the bonding pool, and the reward accounting. But gatekeeping is non-exculpatory. Your signed route is your responsibility.
+
+## Byos Availability
+
+Currently, BYOS is only available in **staging competition** of **BNB chain**.
+
+Some information that might be useful:
+
+|name|value|
+|---|---|
+|Order Book API|`https://barn.api.cow.fi/bnb`|
+|CoW explorer|`https://dev.explorer.cow.fi/`|
+|CoW frontend|`https://dev.swap.cow.fi/`|
+|BYOS endpoint|`https://byos-bnb-staging.bleu.builders`|
+|Escrow address|`0x30729320BD36E6F0FD117A956921f6Fc3F34333A`|
+|Trampoline factory address|`0x934b5d82f45F154936E3f9e0aBc803d2fa4ad49c`|
+|Max. valid until|5 minutes ahead|
+|Min collateral|0.0005 BNB|
+
 
 ## 1. Understand the risks
 
@@ -168,7 +186,7 @@ To cancel a proposal before it settles, send a signed `DELETE` request. Proposal
 | Lost the auction | None | Your proposal stays live and competes in the next auction. |
 | Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
 | BYOS won but did not settle | Smaller Track A debit | Same dispute window and grounds. |
-| CoW raised an EBBO or fairness claim | [Track B](../design-document#track-b) passthrough | BYOS freezes your balance and sends you the certificate and evidence. |
+<!-- | CoW raised an EBBO or fairness claim | [Track B](../design-document#track-b) passthrough | BYOS freezes your balance and sends you the certificate and evidence. | -->
 
 ### Rate limits: `429` and `503`
 
@@ -186,22 +204,22 @@ The gate is on submission alone. Reading and cancelling keep working at any bala
 
 Simulation failures do not cost escrow. Only on-chain failures cause escrow debits. If a revert is caused by BYOS's own orchestration (not your route), BYOS pays.
 
-### Track B operational readiness
+<!-- ### Track B operational readiness
 
 Track B claims need operational readiness. Claims can arrive up to three months after the trade. Your refutation window is 36 hours. The CoW core team arbitrates (not BYOS). BYOS cannot fabricate a claim against you, but it also cannot waive one.
 
 If you cannot respond to evidence requests within 36 hours, this is a risk you must plan for.
 
-Every penalty action emits an on-chain Escrow event. You can use these events to audit your own history.
+Every penalty action emits an on-chain Escrow event. You can use these events to audit your own history. -->
 
 ## 8. Reference implementations
 
-Two baseline sub-solver examples exist. Both do the full loop: fetch orders, compute a Uniswap V2 route, sign an EIP-712 proposal, submit, poll, and resubmit.
-
-| Language | Location | Notes |
-|---|---|---|
-| **Rust** | [`crates/subsolver`](https://github.com/bleu/byos-service/tree/main/crates/subsolver) in `byos-service` | Used in the Rust service's end-to-end test suite. |
-| **TypeScript** | [`apps/subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/subsolver) in `byos-service-ts` | Uses viem for EIP-712 signing. Uses multicall for reserve fetching. |
+| Language | Location |
+|---|---|
+| **Rust** | [`crates/subsolver`](https://github.com/bleu/byos-service/tree/main/crates/subsolver) in `byos-service` |
+| **TypeScript** | [`apps/subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/subsolver) in `byos-service-ts` |
+| **TypeScript** | [`apps/fynd-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/fynd-subsolver) in `byos-service-ts` |
+| **TypeScript** | [`apps/private-mm-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/private-mm-subsolver) in `byos-service-ts` |
 
 The protocol is language-neutral. Use either example for the sequence, the EIP-712 construction, and the polling behavior. The [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml) specifies all wire-level details.
 
@@ -219,4 +237,4 @@ Before you go live, make sure that:
 - [ ] If you are a private MM, your inventory is held in your own contract with an approval to your Trampoline — not deposited directly in the Trampoline instance.
 - [ ] For partially fillable orders, your `sellAmount` does not exceed the remaining fillable amount, and both buy amounts satisfy the scaled limit price.
 - [ ] You have a polling loop that resubmits (not fire-and-forget).
-- [ ] You have an operational process to respond to a Track B claim within 36 hours.
+<!-- - [ ] You have an operational process to respond to a Track B claim within 36 hours. -->
