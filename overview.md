@@ -64,6 +64,10 @@ Step-by-step instructions to go from zero to a settled proposal. Covers escrow d
 
 Definitions for all domain terms. Every implementation repo uses this vocabulary.
 
+### [Deployment](operations/deployment)
+
+Step-by-step guide to deploy a new BYOS instance. Covers the contract deployment order, service configuration, and verification.
+
 ### [SLO targets](operations/slo-targets)
 
 Latency targets for `/solve`, `GET /proposals`, and the validation loop.
