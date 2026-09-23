@@ -68,6 +68,10 @@ Definitions for all domain terms. Every implementation repo uses this vocabulary
 
 Step-by-step guide to deploy a new BYOS instance. Covers the contract deployment order, service configuration, and verification.
 
+### [Operational runbook](operations/runbook)
+
+Admin dashboard reference, log lines by worker, Slack notification events, uptime monitoring, and a monitoring checklist for operators.
+
 ### [SLO targets](operations/slo-targets)
 
 Latency targets for `/solve`, `GET /proposals`, and the validation loop.
