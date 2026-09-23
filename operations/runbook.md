@@ -135,7 +135,7 @@ Failed notification jobs retry up to 5 times with exponential backoff. If a noti
 
 The service tracks known sub-solver addresses in a Redis set. When a sub-solver sends its first proposal, the set does not contain its address, so a "new sub-solver connected" notification fires.
 
-If Redis restarts without persistence enabled, this set is lost. On the next proposal from any existing sub-solver, the notification fires again as if it were a new connection. To prevent this, enable AOF persistence on your Redis instance.
+`docker-compose.prod-local.yml` enables AOF persistence (`--appendonly yes`) by default. If you are running Redis outside that compose file, ensure `--appendonly yes` is set — without it, every Redis restart will re-fire the "new sub-solver connected" notification for every known sub-solver.
 
 ## Uptime monitoring
 
