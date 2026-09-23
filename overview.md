@@ -80,6 +80,10 @@ Latency targets for `/solve`, `GET /proposals`, and the validation loop.
 
 Proof that a sub-solver's route cannot reach `GPv2Settlement` funds.
 
+### [Active deployments](reference/deployments)
+
+Chain-specific addresses, endpoints, and parameters for each active BYOS deployment.
+
 ### CoW protocol reference
 
 Background material on the CoW mechanisms BYOS depends on:

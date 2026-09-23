@@ -28,18 +28,7 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 
 Currently, BYOS is only available in **staging competition** of **BNB chain**.
 
-Some information that might be useful:
-
-|name|value|
-|---|---|
-|Order Book API|`https://barn.api.cow.fi/bnb`|
-|CoW explorer|`https://dev.explorer.cow.fi/`|
-|CoW frontend|`https://dev.swap.cow.fi/`|
-|BYOS endpoint|`https://byos-bnb-staging.bleu.builders`|
-|Escrow address|`0x30729320BD36E6F0FD117A956921f6Fc3F34333A`|
-|Trampoline factory address|`0x934b5d82f45F154936E3f9e0aBc803d2fa4ad49c`|
-|Max. valid until|5 minutes ahead|
-|Min collateral|0.0005 BNB|
+See [Active deployments](../reference/deployments) for addresses, endpoints, and chain-specific parameters.
 
 
 ## 1. Understand the risks
