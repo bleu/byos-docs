@@ -40,6 +40,11 @@ const PAGES: { path: string; url: string; summary: string }[] = [
       'Adversarial proof that a sub-solver route reaches only its own trampoline instance.',
   },
   {
+    path: 'reference/deployments.md',
+    url: '/reference/deployments',
+    summary: 'Chain-specific addresses, endpoints, and parameters for each active BYOS deployment.',
+  },
+  {
     path: 'reference/cow-fee-collection.md',
     url: '/reference/cow-fee-collection',
     summary: 'How CoW fees work: a price wedge, settled by weekly accounting. Third-party background.',
