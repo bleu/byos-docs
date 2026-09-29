@@ -523,7 +523,7 @@ Every transition:
 | `Executing` | `Active` | Driver `Cancelled`, `Expired`, or `Fail` (submission abandoned, no transaction landed), or the executing timeout elapsed. Queues the non-settlement debit. |
 | `SettleFailed` | `Penalized` | The Track A escrow debit lands on-chain. Penalty transaction hash recorded. |
 
-**Losing an auction is not a state.** A proposal outscored internally, or whose solution lost the external competition, is still valid and keeps competing. Participation is recorded as data, so "which auctions did this compete in and lose" is a query, not a status. Winning *is* a state change, because it changes what the service does: it must stop offering the proposal and stop re-simulating it.
+**Competitive losses are terminal states.** When BYOS picks a winning sub-solver for an order at `/solve` time, all active proposals for that order from *other* sub-solvers are immediately marked `Rejected: SubsolverOutbid`. Proposals from the same sub-solver as the winner are left untouched — BYOS may fall back to a same-solver runner-up within one auction cycle if the best proposal's fee cut breaches the signed limit. When the winning BYOS solution loses the on-chain auction to an external solver, the subsequent simulation revert with reason `"GPv2: order filled"` is translated to `Rejected: SolverOutbid`. Both transitions are recorded in the audit log and exposed through the standard `GET /proposal/{id}` response so sub-solvers can distinguish competitive losses from genuine route failures.
 
 **Replacement is an activation-time, atomic group transition.** A successfully validated proposal becomes `Active` only if it is still the newest eligible submission for its `(subSolver, orderUid)` group. In that same serialized transaction, it changes every older `Submitted` or `Active` proposal in the group to `Cancelled`; `Executing` proposals are unchanged. This ordering prevents an older validator job from replacing or reactivating a newer proposal.
 
@@ -558,6 +558,8 @@ Every reason a proposal stops competing, grouped by when it happens:
 | Amount mismatch | Proposal amounts don't match the order (fill-or-kill mismatch, or partial fill violates limits) |
 | Unprofitable | Score (`surplus - gas`) is zero or negative on first simulation |
 | Simulation failed | The full settlement simulation reverted — terminal on first occurrence, no retries |
+| `SubsolverOutbid` | BYOS selected a different sub-solver's proposal for this order at `/solve` time |
+| `SolverOutbid` | The BYOS solution was sent to the driver but an external solver won the on-chain auction (`"GPv2: order filled"` revert) |
 
 **By lifecycle (not a rejection, but the proposal stops competing)**
 
