@@ -401,11 +401,22 @@ The public HTTP surface by which sub-solvers submit signed proposals. Field-leve
 | Endpoint | Purpose |
 |---|---|
 | `POST /proposals` | Submit a signed proposal. Answers `202 Accepted` with an id. |
-| `GET /proposal/{id}` | The caller's full proposal: all amounts, tokens, interactions, simulation results, and timestamps. Falls back to the permanent log for swept proposals. |
+| `GET /proposal/{id}` | The caller's full proposal: all amounts, tokens, interactions, simulation results, and timestamps. Once the proposal has competed in an auction, also includes auction-time price snapshots. Falls back to the permanent log for swept proposals. |
 | `GET /proposals/{order_uid}` | The caller's proposals on that order. Accepts `?includeArchived=true` to include swept proposals. |
 | `GET /proposals/by-sub-solver` | All of the caller's proposals. Accepts `?includeArchived=true` to include full history. |
 | `GET /buffer-balance` | The caller's outstanding buffer balance, clearing threshold, and per-proposal entries. |
 | `DELETE /proposal/{id}` | Cancellation by the original signer. |
+
+**`GET /proposal/{id}` price snapshot fields.** Once a proposal has been selected at `/solve` time, the response includes the auction-time reference prices and clearing prices used to score it:
+
+| Field | Type | Description |
+|---|---|---|
+| `sellTokenRefPrice` | string (decimal wei) | Native-token price of the sell token at auction time. |
+| `surplusTokenRefPrice` | string (decimal wei) | Native-token price of the surplus token (buy token on sell orders, sell token on buy orders). |
+| `auctionGasPrice` | string (decimal wei) | Effective gas price from the auction (`effectiveGasPrice`). |
+| `clearingPrices` | object `{ [tokenAddress]: string }` | Clearing prices submitted with the solution, keyed by token address. |
+
+All four fields are absent until the proposal first competes in an auction. They are written once and kept permanently in `proposals_log`, so they remain readable after the active proposal row is swept.
 
 `POST` carries `sellToken` and `buyToken` because they are part of the EIP-712 signed struct. The service validates them against the orderbook order during proposal validation.
 
