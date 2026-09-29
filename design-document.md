@@ -396,14 +396,14 @@ The **factory is a domain anchor**. Binding `verifyingContract` to the Trampolin
 
 ## Proposal API
 
-The public HTTP surface by which sub-solvers submit signed proposals. Field-level types, status codes, and error shapes are specified in [`crates/byos/openapi.yml`](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml) in the service repo, which is the authority for the wire contract; this section specifies its semantics.
+The public HTTP surface by which sub-solvers submit signed proposals. Field-level types, status codes, and error shapes are specified in [`apps/byos/openapi.yml`](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) in the service repo, which is the authority for the wire contract; this section specifies its semantics.
 
 | Endpoint | Purpose |
 |---|---|
 | `POST /proposals` | Submit a signed proposal. Answers `202 Accepted` with an id. |
-| `GET /proposal/{id}` | The caller's own proposal, including status and any rejection reason. |
-| `GET /proposals/{order_uid}` | The caller's own proposals on that order. |
-| `GET /proposals/by-sub-solver` | All of the caller's proposals. |
+| `GET /proposal/{id}` | The caller's full proposal: all amounts, tokens, interactions, simulation results, and timestamps. Falls back to the permanent log for swept proposals. |
+| `GET /proposals/{order_uid}` | The caller's proposals on that order. Accepts `?includeArchived=true` to include swept proposals. |
+| `GET /proposals/by-sub-solver` | All of the caller's proposals. Accepts `?includeArchived=true` to include full history. |
 | `GET /buffer-balance` | The caller's outstanding buffer balance, clearing threshold, and per-proposal entries. |
 | `DELETE /proposal/{id}` | Cancellation by the original signer. |
 
@@ -531,7 +531,7 @@ Every transition:
 
 Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a cancellation, replacement, or notification won the race.
 
-**Terminal retention has one knob.** Rejected, sim-failed, expired, and cancelled rows are deleted an hour after reaching the state; consumers are polling loops that observe a terminal state within one interval, and after that the proposal is a 404. The money states — settled, settle-failed, penalized — are kept indefinitely, with no sweep code at all. `audit_events` has no deletion path.
+**Terminal retention has one knob.** Rejected, sim-failed, expired, and cancelled rows are swept from the active store an hour after reaching the state; consumers observe the terminal state within one polling interval before that happens. The money states — settled, settle-failed, penalized — are never swept. `audit_events` has no deletion path. All proposals, regardless of status, are mirrored to a permanent `proposals_log` table kept in sync by a database trigger; `GET /proposal/{id}` falls back to that log automatically, so a swept proposal is never a 404.
 
 ### Rejection reference
 

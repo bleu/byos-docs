@@ -88,7 +88,9 @@ Runs on the same interval as validation. Processes Track A debits and post-settl
 
 ### Retention sweep
 
-Runs every ~5 minutes. Deletes terminal proposals (`Rejected`, `SimFailed`, `Expired`, `Cancelled`) that have been in their terminal state for more than 1 hour. Money states (`Settled`, `SettleFailed`, `Penalized`) are kept indefinitely — they are dispute evidence.
+Runs every ~5 minutes. Removes terminal proposals (`Rejected`, `SimFailed`, `Expired`, `Cancelled`) from the active store once they have been in their terminal state for more than 1 hour. Money states (`Settled`, `SettleFailed`, `Penalized`) are never swept — they are dispute evidence.
+
+Swept proposals are not lost: every proposal is mirrored to a permanent `proposals_log` table by a database trigger. `GET /proposal/{id}` falls back to that log automatically, and the list endpoints accept `?includeArchived=true` to query it directly.
 
 ## Proposal lifecycle
 

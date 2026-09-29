@@ -2,7 +2,7 @@
 
 This guide tells you how to go from zero to a settled proposal.
 
-All normative facts (field names, amounts, signature formats, penalty amounts) are in [the design document](../design-document) or the [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml). This guide links to them and does not repeat them. If this guide and one of those disagree, the source document is correct.
+All normative facts (field names, amounts, signature formats, penalty amounts) are in [the design document](../design-document) or the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml). This guide links to them and does not repeat them. If this guide and one of those disagree, the source document is correct.
 
 You do not need a CoW solver seat, an allowlist entry, or a relationship with CoW DAO. You need an address, collateral in the Escrow, and the ability to sign EIP-712 messages.
 
@@ -124,7 +124,7 @@ Keep `validUntil` short. BYOS caps it at ingestion ([`#proposal-lifecycle`](../d
 
 ## 6. Submit and poll
 
-Send a `POST` request with the proposal. See the [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml) for the payload format, status codes, and rejection reasons.
+Send a `POST` request with the proposal. See the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for the payload format, status codes, and rejection reasons.
 
 ### API endpoints
 
@@ -210,7 +210,7 @@ Every penalty action emits an on-chain Escrow event. You can use these events to
 | **TypeScript** | [`apps/fynd-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/fynd-subsolver) in `byos-service-ts` |
 | **TypeScript** | [`apps/private-mm-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/private-mm-subsolver) in `byos-service-ts` |
 
-The protocol is language-neutral. Use either example for the sequence, the EIP-712 construction, and the polling behavior. The [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml) specifies all wire-level details.
+The protocol is language-neutral. Use either example for the sequence, the EIP-712 construction, and the polling behavior. The [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) specifies all wire-level details.
 
 ## Pre-launch checklist
 
