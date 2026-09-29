@@ -2,7 +2,7 @@
 
 This guide tells you how to go from zero to a settled proposal.
 
-All normative facts (field names, amounts, signature formats, penalty amounts) are in [the design document](../design-document) or the [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml). This guide links to them and does not repeat them. If this guide and one of those disagree, the source document is correct.
+All normative facts (field names, amounts, signature formats, penalty amounts) are in [the design document](../design-document) or the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml). This guide links to them and does not repeat them. If this guide and one of those disagree, the source document is correct.
 
 You do not need a CoW solver seat, an allowlist entry, or a relationship with CoW DAO. You need an address, collateral in the Escrow, and the ability to sign EIP-712 messages.
 
@@ -124,7 +124,7 @@ Keep `validUntil` short. BYOS caps it at ingestion ([`#proposal-lifecycle`](../d
 
 ## 6. Submit and poll
 
-Send a `POST` request with the proposal. See the [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml) for the payload format, status codes, and rejection reasons.
+Send a `POST` request with the proposal. See the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for the payload format, status codes, and rejection reasons.
 
 ### API endpoints
 
@@ -133,9 +133,10 @@ All endpoints are on the public listener (default port 9585):
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `202` with an id. Replaying identical signed content returns the original id; reusing its nonce with different signed content returns `409 NonceAlreadyUsed`. This is **not** acceptance. |
-| `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. |
-| `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. |
-| `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. |
+| `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
+| `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
+| `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
+| `GET` | `/openapi.yaml` | None | Machine-readable OpenAPI 3 spec for the full API. Use this to generate a client or validate your integration. |
 | `GET` | `/buffer-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding buffer balance, the clearing threshold, and individual per-proposal entries. |
 | `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Submitted` or `Active` proposals. |
 
@@ -172,7 +173,8 @@ To cancel a proposal before it settles, send a signed `DELETE` request. Proposal
 | `409 NonceAlreadyUsed` | None | The nonce was already used for different signed content. Generate a new nonce; retrying the exact same signed proposal is safe and returns its original id. |
 | `403` insufficient escrow | None | Your cached balance is below the minimum collateral. Deposit more. Submission only — reads and cancellations keep working. |
 | Expired | None | Your `validUntil` passed. Use a shorter interval. |
-| Lost the auction | None | Your proposal stays live and competes in the next auction. |
+| `SubsolverOutbid` | None | BYOS selected a different sub-solver for this order. Resubmit with a better route for the next auction. |
+| `SolverOutbid` | None | BYOS won the internal competition but an external solver settled the order first. Resubmit or move to the next order. |
 | Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
 | BYOS won but did not settle | Smaller Track A debit | Same dispute window and grounds. |
 <!-- | CoW raised an EBBO or fairness claim | [Track B](../design-document#track-b) passthrough | BYOS freezes your balance and sends you the certificate and evidence. | -->
@@ -210,7 +212,7 @@ Every penalty action emits an on-chain Escrow event. You can use these events to
 | **TypeScript** | [`apps/fynd-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/fynd-subsolver) in `byos-service-ts` |
 | **TypeScript** | [`apps/private-mm-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/private-mm-subsolver) in `byos-service-ts` |
 
-The protocol is language-neutral. Use either example for the sequence, the EIP-712 construction, and the polling behavior. The [OpenAPI document](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml) specifies all wire-level details.
+The protocol is language-neutral. Use either example for the sequence, the EIP-712 construction, and the polling behavior. The [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) specifies all wire-level details.
 
 ## Pre-launch checklist
 
