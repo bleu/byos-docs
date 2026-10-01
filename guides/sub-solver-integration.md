@@ -156,6 +156,8 @@ After you submit, poll for the verdict with `GET /proposal/{id}`. You can see on
 
 Continue to poll after the first verdict. A live proposal is re-simulated every tick. It can fail at any time because chain state changed.
 
+Once the proposal has been selected in an auction, the response includes four price snapshot fields: `sellTokenRefPrice`, `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices`. These are the auction-time prices used to score and settle the proposal. They are absent until the first auction selection and never change afterwards.
+
 Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended operating mode.
 
 ### Cancel a proposal
