@@ -401,22 +401,11 @@ The public HTTP surface by which sub-solvers submit signed proposals. Field-leve
 | Endpoint | Purpose |
 |---|---|
 | `POST /proposals` | Submit a signed proposal. Answers `202 Accepted` with an id. |
-| `GET /proposal/{id}` | The caller's full proposal: all amounts, tokens, interactions, simulation results, and timestamps. Once the proposal has competed in an auction, also includes auction-time price snapshots. Falls back to the permanent log for swept proposals. |
+| `GET /proposal/{id}` | The caller's full proposal: all amounts, tokens, interactions, simulation results, and timestamps. Falls back to the permanent log for swept proposals. |
 | `GET /proposals/{order_uid}` | The caller's proposals on that order. Accepts `?includeArchived=true` to include swept proposals. |
 | `GET /proposals/by-sub-solver` | All of the caller's proposals. Accepts `?includeArchived=true` to include full history. |
 | `GET /buffer-balance` | The caller's outstanding buffer balance, clearing threshold, and per-proposal entries. |
 | `DELETE /proposal/{id}` | Cancellation by the original signer. |
-
-**`GET /proposal/{id}` price snapshot fields.** Once a proposal has been selected at `/solve` time, the response includes the auction-time reference prices and clearing prices used to score it:
-
-| Field | Type | Description |
-|---|---|---|
-| `sellTokenRefPrice` | string (decimal wei) | Native-token price of the sell token at auction time. |
-| `surplusTokenRefPrice` | string (decimal wei) | Native-token price of the surplus token (buy token on sell orders, sell token on buy orders). |
-| `auctionGasPrice` | string (decimal wei) | Effective gas price from the auction (`effectiveGasPrice`). |
-| `clearingPrices` | object `{ [tokenAddress]: string }` | Clearing prices submitted with the solution, keyed by token address. |
-
-All four fields are absent until the proposal first competes in an auction. They are written once and kept permanently in `proposals_log`, so they remain readable after the active proposal row is swept.
 
 `POST` carries `sellToken` and `buyToken` because they are part of the EIP-712 signed struct. The service validates them against the orderbook order during proposal validation.
 
@@ -664,15 +653,11 @@ Re-simulation runs every tick for `Submitted` and `Active` proposals, at an inte
 
 ### Slippage protection
 
-A sub-solver who sets `minBuyAmount` much lower than `quoteBuyAmount` can submit a route that only delivers the floor, passes the on-chain delta check, and settles — while BYOS used `quoteBuyAmount` as the clearing price. The settlement would pay the user more buy tokens than the route delivered, drawing down BYOS's buffer. The sub-solver takes a penalty later, but the immediate buffer draw is real.
+Two controls prevent a sub-solver from submitting a route that delivers fewer buy tokens than `quoteBuyAmount`.
 
-Two controls address this:
+**Clearing price correction.** Simulation captures `Executed._delta` from the Trampoline event (`simulationBuyAmount`). The effective clearing price sent to the driver is `min(simulationBuyAmount, quoteBuyAmount)`. Under-delivery is corrected before the bid is submitted.
 
-**simulationBuyAmount.** The `Executed._delta` from the simulation tells us what the route actually delivered. The effective clearing price is `min(simulationBuyAmount, quoteBuyAmount)`. If the simulation shows under-delivery relative to `quoteBuyAmount`, the bid is corrected before it reaches the driver. This is the primary defense.
-
-**Pre-simulation gap check.** Before dispatching simulation, the validator checks that the `minBuyAmount`/`quoteBuyAmount` spread is within configured limits. This pre-filter catches implausibly wide slippage before consuming an RPC slot.
-
-For **sell orders only**, a proposal is rejected with `ProposedSlippageOutrange` if either cap is exceeded:
+**Gap check.** Before simulation, the validator rejects sell-order proposals whose `minBuyAmount`/`quoteBuyAmount` spread exceeds either cap:
 
 ```
 gap = quoteBuyAmount − minBuyAmount
@@ -681,14 +666,12 @@ bps cap:    gap × 10_000 > quoteBuyAmount × MAX_PROPOSAL_SLIPPAGE_BPS
 native cap: gap × nativePrice > MAX_PROPOSAL_SLIPPAGE_NATIVE × 10^18
 ```
 
-`nativePrice` is the buy token's price in native-token units fetched from the CoW orderbook at validation time. If the price is unavailable for a sell order, the proposal is rejected (fail closed). Buy orders are not checked — the envelope already enforces `minBuyAmount == quoteBuyAmount` for them.
-
-The dual cap prevents two attack shapes: a small-bps gap on a high-value token can still be a large absolute risk; a large-bps gap on a dust token is small absolute risk. Both caps must pass.
+`nativePrice` is the buy token's native-token price from the CoW orderbook. A missing price is a hard rejection. Buy orders are exempt — the envelope enforces `minBuyAmount == quoteBuyAmount`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAX_PROPOSAL_SLIPPAGE_BPS` | `100` | Maximum gap as basis points of `quoteBuyAmount` |
-| `MAX_PROPOSAL_SLIPPAGE_NATIVE` | `1000000000000000000` (1 ETH) | Maximum gap in native-token wei |
+| `MAX_PROPOSAL_SLIPPAGE_BPS` | `100` | Max gap as basis points of `quoteBuyAmount` |
+| `MAX_PROPOSAL_SLIPPAGE_NATIVE` | `1000000000000000000` (1 ETH) | Max gap in native-token wei |
 
 ## Solver engine
 
