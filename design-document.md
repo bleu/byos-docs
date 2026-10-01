@@ -567,8 +567,10 @@ Every reason a proposal stops competing, grouped by when it happens:
 | Order not found | Order UID not in CoW's orderbook (filled, expired, or cancelled) |
 | Unsupported order | Non-ERC20 balance flavors, bridging orders, or (in v1) partially fillable orders |
 | Amount mismatch | Proposal amounts don't match the order (fill-or-kill mismatch, or partial fill violates limits) |
+| Proposed slippage outrange | Gap between `minBuyAmount` and `quoteBuyAmount` exceeds the configured bps or native-token cap (sell orders only) |
 | Unprofitable | Score (`surplus - gas`) is zero or negative on first simulation |
 | Simulation failed | The full settlement simulation reverted — terminal on first occurrence, no retries |
+| Simulation missing Executed event | Simulation succeeded but the Trampoline did not emit an `Executed` event — terminal |
 | `SubsolverOutbid` | BYOS selected a different sub-solver's proposal for this order at `/solve` time |
 | `SolverOutbid` | The BYOS solution was sent to the driver but an external solver won the on-chain auction (`"GPv2: order filled"` revert) |
 
@@ -603,27 +605,40 @@ This covers cases a block scanner would miss, including private submissions and 
 
 ### Simulation
 
-Each proposal is simulated as the transaction the driver would actually submit: a real `settle()` on `GPv2Settlement` carrying the real order, via `eth_estimateGas` so the success verdict and the gas figure come from one RPC call.
+Each proposal is simulated as the transaction the driver would actually submit: a real `settle()` on `GPv2Settlement` carrying the real order, via `eth_simulateV1` (Geth's `blockStateCalls` API).
 
 ```
-eth_estimateGas:
-  from: 0x1111...1111 (dummy submitter)
-  to:   GPv2Settlement
-  data: settle(
-          tokens         = [sellToken, buyToken],
-          clearingPrices = [proposal.quoteBuyAmount, proposal.sellAmount],
-          trades         = [the real order: fields and signature from the orderbook],
-          interactions   = [[], [sellToken.transfer(trampoline, sellAmount),
-                                 trampoline.execute(...)], []]
-        )
-state overrides:
-  authenticator -> code: AnyoneAuthenticator
-  escrow        -> state_diff: hasRole(SUBMITTER_ROLE, dummy) = true
+eth_simulateV1 blockStateCalls[0]:
+  calls[0]:
+    from: 0x1111...1111 (dummy submitter)
+    to:   GPv2Settlement
+    data: settle(
+            tokens         = [sellToken, buyToken],
+            clearingPrices = [proposal.quoteBuyAmount, proposal.sellAmount],
+            trades         = [the real order: fields and signature from the orderbook],
+            interactions   = [[], [sellToken.transfer(trampoline, sellAmount),
+                                   trampoline.execute(...)], []]
+          )
+  stateOverrides:
+    authenticator -> code: AnyoneAuthenticator
+    escrow        -> stateDiff: { slot(hasRole(SUBMITTER_ROLE, dummy)) = true }
 ```
 
 Because the order is real, the user has genuinely approved the vault relayer and holds the sell tokens. No balance faking, no allowance faking, no per-token storage-slot detection. Everything runs at real addresses, so the floor-and-sweep semantics behave exactly as in production and GPv2's own checks — order signature, limit price, `validTo`, filled amount — come along for free. The two overrides stand in only for permissions the dummy sender lacks, and both become unnecessary once a production submitter address holds the role on-chain.
 
 The simulation does not model three calldata words: the encoder fixes the executed amount at the full order amount and the clearing prices at the raw proposal amounts, while the real transaction subtracts the gas cut and substitutes the driver's own per-trade prices, then applies protocol fees. The gas is the same — same tokens, same interactions, same trade, same storage touched — and the divergence is one-directional, since the real transaction pays the user less than the simulated one, never more. A proposal that simulates successfully therefore cannot fail the settlement's limit check because of the cut.
+
+**simulationBuyAmount and the effective clearing price.** `eth_simulateV1` returns the logs emitted during simulation. The Trampoline emits `Executed(_orderUidHash, _delta, _floor, _ceiling)` where `_delta` is the actual buy-token amount the route delivered to the settlement. This value is stored as `simulationBuyAmount` on the proposal. At `/solve` time, the effective clearing price is:
+
+```
+effectiveBuyAmount = min(simulationBuyAmount, quoteBuyAmount)
+```
+
+If the route delivered less than `quoteBuyAmount` during simulation, the clearing price is corrected downward so the settlement is never sent with an inflated bid. If `simulationBuyAmount` is unavailable (pre-feature proposal or rejection before simulation), the clearing price falls back to `quoteBuyAmount`.
+
+A missing `Executed` event rejects the proposal with `SimulationMissingExecutedEvent` (terminal).
+
+**Pre-simulation gap check.** Before dispatching simulation, a cheap check rejects proposals where `minBuyAmount` is too far below `quoteBuyAmount` on sell orders (see [`#slippage-protection`](#slippage-protection)). This is a pre-filter: it prevents proposals with implausibly wide slippage from consuming an RPC slot.
 
 Order data is fetched once from the CoW orderbook and cached for the process lifetime, since orders are immutable after placement. An off-chain soft-cancel is invisible to the service; the proposal's own `validUntil` bounds the window and the driver re-validates at settlement time, so nothing wrong can land on-chain.
 
@@ -647,6 +662,34 @@ All four signature schemes are supported, since the scheme is encoded in the tra
 
 Re-simulation runs every tick for `Submitted` and `Active` proposals, at an interval targeting about one block. `Executing` proposals are not simulated. This is deliberately not every-block simulation of everything; the driver's own post-encoding re-simulation catches proposals that go stale in between.
 
+### Slippage protection
+
+A sub-solver who sets `minBuyAmount` much lower than `quoteBuyAmount` can submit a route that only delivers the floor, passes the on-chain delta check, and settles — while BYOS used `quoteBuyAmount` as the clearing price. The settlement would pay the user more buy tokens than the route delivered, drawing down BYOS's buffer. The sub-solver takes a penalty later, but the immediate buffer draw is real.
+
+Two controls address this:
+
+**simulationBuyAmount.** The `Executed._delta` from the simulation tells us what the route actually delivered. The effective clearing price is `min(simulationBuyAmount, quoteBuyAmount)`. If the simulation shows under-delivery relative to `quoteBuyAmount`, the bid is corrected before it reaches the driver. This is the primary defense.
+
+**Pre-simulation gap check.** Before dispatching simulation, the validator checks that the `minBuyAmount`/`quoteBuyAmount` spread is within configured limits. This pre-filter catches implausibly wide slippage before consuming an RPC slot.
+
+For **sell orders only**, a proposal is rejected with `ProposedSlippageOutrange` if either cap is exceeded:
+
+```
+gap = quoteBuyAmount − minBuyAmount
+
+bps cap:    gap × 10_000 > quoteBuyAmount × MAX_PROPOSAL_SLIPPAGE_BPS
+native cap: gap × nativePrice > MAX_PROPOSAL_SLIPPAGE_NATIVE × 10^18
+```
+
+`nativePrice` is the buy token's price in native-token units fetched from the CoW orderbook at validation time. If the price is unavailable for a sell order, the proposal is rejected (fail closed). Buy orders are not checked — the envelope already enforces `minBuyAmount == quoteBuyAmount` for them.
+
+The dual cap prevents two attack shapes: a small-bps gap on a high-value token can still be a large absolute risk; a large-bps gap on a dust token is small absolute risk. Both caps must pass.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_PROPOSAL_SLIPPAGE_BPS` | `100` | Maximum gap as basis points of `quoteBuyAmount` |
+| `MAX_PROPOSAL_SLIPPAGE_NATIVE` | `1000000000000000000` (1 ETH) | Maximum gap in native-token wei |
+
 ## Solver engine
 
 BYOS is the **solver engine** half of a standard CoW driver and solver pair. The driver — unmodified, run by CoW — handles encoding, gas simulation, scoring, and submission. The engine's job is narrower: answer `/solve` with candidate solutions from the proposal store.
@@ -666,7 +709,7 @@ Settlement overhead is therefore paid per order and never amortized, and netting
 `score = surplus - gas`, in native-token units.
 
 - **Surplus** is the improvement beyond the order's limit price — extra buy tokens on a sell order, sell tokens kept back on a buy order — converted at the auction's reference price.
-- **Gas** is the simulated `eth_estimateGas` result plus a 30k buffer, cached on the proposal, times the auction's effective gas price. The buffer is small because the full-settle estimate already covers intrinsic gas and the whole settlement path, so it only absorbs warm and cold storage differences and driver batching variance.
+- **Gas** is the simulated gas (`call.gasUsed` from `eth_simulateV1`) plus a 30k buffer, cached on the proposal, times the auction's effective gas price. The buffer is small because the full-settle estimate already covers intrinsic gas and the whole settlement path, so it only absorbs warm and cold storage differences and driver batching variance.
 
 **There is no fee term.** CoW's score is surplus plus protocol fees and nothing else; gas never appears as a subtraction there. It reaches the score only because a solver declares gas as its own fee, which lowers what the user receives, which lowers surplus. The protocol fee then cancels out of any ranking — it is carved out of surplus and added straight back — so `score = route surplus − our own cut`. Once the cut equals the gas cost ([`#gas`](#gas)), `surplus − gas` is the score the autopilot will compute for the bid.
 
@@ -687,7 +730,7 @@ One winner per order UID, filtered and ranked at `/solve` time with local comput
 
 A winner with a non-positive score is not returned: settling a trade expected to cost more in gas than it earns in surplus is worse than skipping the order. The escrow re-check is not on this path — the background validator owns it.
 
-**Amount matching is strict, with no clamping.** Fill-or-kill proposals must satisfy the order's limit price using `quoteBuyAmount`; partially fillable proposals must not exceed the remaining fillable amount. BYOS never adapts proposal amounts, because the sub-solver computed a route for specific amounts and changing them would invalidate it. Sub-solvers resubmit through their polling loops when order state moves.
+**Amount matching is strict, with no clamping.** Fill-or-kill proposals must satisfy the order's limit price using `effectiveBuyAmount` (which is `min(simulationBuyAmount, quoteBuyAmount)`); partially fillable proposals must not exceed the remaining fillable amount. Scoring and clearing prices also use `effectiveBuyAmount`, not the raw `quoteBuyAmount`. BYOS never adapts proposal amounts, because the sub-solver computed a route for specific amounts and changing them would invalidate it. Sub-solvers resubmit through their polling loops when order state moves.
 
 **EBBO baseline is not re-checked at `/solve`.** The ingestion-time check is the primary gatekeeping layer, and re-running it on the hot path would add a price lookup for marginal safety.
 
