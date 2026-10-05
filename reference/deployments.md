@@ -16,3 +16,5 @@ BYOS is currently available in staging competition on BNB Chain.
 | Trampoline Factory address | `0x934b5d82f45F154936E3f9e0aBc803d2fa4ad49c` |
 | Max `validUntil` | 5 minutes ahead |
 | Min collateral | 0.0005 BNB |
+| `MAX_PROPOSAL_SLIPPAGE_BPS` | 1 bps |
+| `MAX_PROPOSAL_SLIPPAGE_NATIVE` | 1 BNB |

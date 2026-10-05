@@ -244,7 +244,7 @@ As defense in depth, BYOS authors the approvals itself: exact `sellAmount`, rout
 
 Native ETH follows the same rule. The instance performs any required WETH wrap or unwrap internally, within the single settlement, and any ETH balance remaining afterwards is swept back or the settlement reverts.
 
-**Deployment happens at escrow-deposit time, paid by the sub-solver.** `Escrow.deposit()` triggers the factory's idempotent `ensureDeployed` for the credited sub-solver. Settlements assume the instance exists; there is no on-chain existence guard in the hot path. Since the API is permissionless but collateral-gated, no escrow deposit means no valid proposal, so a valid proposal implies a deployed trampoline. The only residual is a reorg of the deposit transaction, handled as an infra failure ([`#track-a`](#track-a)).
+**Deployment happens at escrow-deposit time, paid by the sub-solver.** `Escrow.deposit()` triggers the factory's idempotent `ensureDeployed` for the credited sub-solver. Settlements assume the instance exists; there is no on-chain existence guard in the hot path. Since the API is collateral-gated, no escrow deposit means no valid proposal, so a valid proposal implies a deployed trampoline. The only residual is a reorg of the deposit transaction, handled as an infra failure ([`#track-a`](#track-a)).
 
 Per-instance isolation earns its keep on three things a shared trampoline cannot offer: it confines any un-sweepable residual to its originating sub-solver, it permits safe approval reuse for gas, and it gives on-chain attribution ([`#attribution`](#attribution)).
 
@@ -870,7 +870,7 @@ The arbiter is the **CoW core team**, not BYOS. They already adjudicate EBBO, an
 
 Track B stays out of the proposal state machine: a ruling months later is an account-level event against the sub-solver, not a transition of one proposal.
 
-The 36h sub-solver window is tight, and permissionless participants without responsive operations may struggle. It is what remains after BYOS reserves the other 36h of its own 72h CoW window to process and relay.
+The 36h sub-solver window is tight, and sub-solvers without responsive operations may struggle. It is what remains after BYOS reserves the other 36h of its own 72h CoW window to process and relay.
 
 **Track B has an unrecoverable gap.** If the sub-solver has withdrawn, or the escrow is smaller than the claim, BYOS absorbs the difference.
 

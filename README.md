@@ -1,6 +1,6 @@
 # BYOS documentation
 
-The shared, normative specification for **BYOS (Bring Your Own Solver)** — a bonded CoW Protocol solver whose solutions are sourced from a permissionless set of external sub-solvers.
+The shared, normative specification for **BYOS (Bring Your Own Solver)** — a bonded CoW Protocol solver whose solutions are sourced from external sub-solvers.
 
 Published at **https://bleu.github.io/byos-docs**.
 
