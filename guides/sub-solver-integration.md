@@ -13,7 +13,7 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 - **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
 - **Order selection.** Find orders in CoW's public orderbook. Compute any route that delivers buy tokens to the GPv2Settlement contract. Assume execution from Trampoline with sell tokens on it.
 - **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. The safest and recommended option is enforcing `minBuyAmount = quoteBuyAmount`. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into loose slippage — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
-- **Venue-level fees.** If your route goes through a pool you operate, you keep those fees. To capture surplus above your floor, do it inside your route before the sweep.
+- **CoW solver rewards.** BYOS does not forward CoW solver rewards to sub-solvers. To earn on a trade, embed a fee inside your route before the sweep — for example, by routing through a pool you operate or by setting your output amount below what the route actually delivers.
 <!-- - **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade. -->
 
 **You are NOT responsible for:**
@@ -41,6 +41,8 @@ When a settlement that carries your route fails on-chain, BYOS debits the cost f
 
 **Loose slippage (sell orders only).** When you set `minBuyAmount < quoteBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `quoteBuyAmount`. If the route delivers between the two, the difference `quoteBuyAmount − delivered` is converted to native token and recorded as a buffer entry you owe. If the route over-delivers above `quoteBuyAmount`, the difference is recorded as a credit that offsets future shortfalls but is never paid out. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Monitor your running balance with `GET /buffer-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
 
+**Slippage limits.** BYOS enforces two per-proposal caps on the gap between `quoteBuyAmount` and `minBuyAmount`: `MAX_PROPOSAL_SLIPPAGE_BPS` (maximum gap as a fraction of `quoteBuyAmount`, in basis points) and `MAX_PROPOSAL_SLIPPAGE_NATIVE` (maximum gap in native token value). Proposals that exceed either limit are rejected at ingestion. See [Active deployments](../reference/deployments) for the current values on each chain.
+
 ## 2. Deposit collateral
 
 Deposit native token into the [Escrow](../design-document#escrow) for your address. Any address can fund a sub-solver address. Only the sub-solver address can withdraw.
@@ -63,7 +65,7 @@ The new address gets its own Trampoline instance. Your old proposals do not foll
 
 ## 3. Find orders to route
 
-BYOS does not operate an orderbook. Orders come from CoW's public orderbook API.
+BYOS does not operate an orderbook. Orders come from CoW's orderbook API. Access to the production orderbook may require permission from the CoW team.
 
 One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format. Both fill-or-kill and partially fillable orders are supported. For partially fillable orders, your proposal's `sellAmount` can be any amount up to the order's remaining fillable amount, and both `minBuyAmount` and `quoteBuyAmount` must independently satisfy the proportionally scaled limit price.
 
@@ -155,6 +157,8 @@ A `2xx` response means "accepted for validation". BYOS stores the proposal as `S
 After you submit, poll for the verdict with `GET /proposal/{id}`. You can see only your own proposals. Expect a verdict within approximately one block. The validator tick interval determines the latency, not the request round-trip. See [SLO targets](../operations/slo-targets).
 
 Continue to poll after the first verdict. A live proposal is re-simulated every tick. It can fail at any time because chain state changed.
+
+Once the proposal has been selected in an auction, the response includes four price snapshot fields: `sellTokenRefPrice`, `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices`. These are the auction-time prices used to score and settle the proposal. They are absent until the first auction selection and never change afterwards.
 
 Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended operating mode.
 

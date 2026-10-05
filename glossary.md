@@ -8,7 +8,7 @@ Source RFP: [Bring Your Own Solver (BYOS)](https://forum.cow.fi/t/rfp-bring-your
 
 ## What BYOS is
 
-A **bonded CoW solver** whose proposed solutions are sourced from a permissionless set of **external sub-solvers**. Sub-solvers submit signed routing proposals against specific order UIDs, collateralized by an escrow balance held by BYOS. BYOS retains exclusive control over on-chain settlement submission. From the protocol's perspective BYOS is a single, ordinary bonded solver — the sub-solver relationship is entirely internal to BYOS.
+A **bonded CoW solver** whose proposed solutions are sourced from **external sub-solvers**. Sub-solvers submit signed routing proposals against specific order UIDs, collateralized by an escrow balance held by BYOS. BYOS retains exclusive control over on-chain settlement submission. From the protocol's perspective BYOS is a single, ordinary bonded solver — the sub-solver relationship is entirely internal to BYOS.
 
 v1 targets **Ethereum mainnet + Gnosis**. Out of scope: a BYOS-operated orderbook, reward pass-through to sub-solvers, cross-chain escrow accounting, and BYOS's own bonding capital.
 
@@ -26,7 +26,7 @@ The core economic framing. Everything about escrow, penalties, and gatekeeping f
 
 ## Terms
 
-- **Sub-solver** — an external, permissionless party that computes a route for a specific order and submits a signed proposal to BYOS. Never holds submission keys; never calls `settle`. Identified by its address, recovered from its EIP-712 signature; that same address is its escrow key and its Trampoline CREATE2 salt. It is `sub_solver`, never plain `solver` — in CoW's vocabulary `solver` means BYOS itself.
+- **Sub-solver** — an external party that computes a route for a specific order and submits a signed proposal to BYOS. Never holds submission keys; never calls `settle`. Identified by its address, recovered from its EIP-712 signature; that same address is its escrow key and its Trampoline CREATE2 salt. It is `sub_solver`, never plain `solver` — in CoW's vocabulary `solver` means BYOS itself.
 
 - **Proposal** — an EIP-712-signed message authorizing BYOS to attempt a settlement of a specific route, and consenting to the associated escrow risk. Immutable: amounts (`sellAmount`, `minBuyAmount`, `quoteBuyAmount`), interactions, expiry, nonce, and signature form one signed unit, so there is no update operation. One proposal commits to exactly one order. Field-level definition is in [the design document](design-document#proposal-schema); the wire shape is in `byos-service`'s [`crates/byos/openapi.yml`](https://github.com/bleu/byos-service/blob/main/crates/byos/openapi.yml).
 
