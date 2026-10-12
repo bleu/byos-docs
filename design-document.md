@@ -22,7 +22,7 @@ These anchors are the interface between this document and every ADR that cites i
 | [`#proposal-api`](#proposal-api) | HTTP surface, authentication, rate limiting |
 | [`#proposal-lifecycle`](#proposal-lifecycle) | State machine, simulation, retention |
 | [`#solver-engine`](#solver-engine) | Selection, scoring, settlement crafting |
-| [`#single-order-solutions`](#single-order-solutions) | One order per proposal, per settlement |
+| [`#single-order-solutions`](#single-order-solutions) | One order per proposal; same-sub-solver settlement batches |
 | [`#gas`](#gas) | The gas cut and how CoW fees actually work |
 | [`#penalties`](#penalties) | The penalty schedule as a whole |
 | [`#track-a`](#track-a) | Revert, deadline, and non-settlement debits |
@@ -674,13 +674,11 @@ BYOS is the **solver engine** half of a standard CoW driver and solver pair. The
 
 ### Single-order solutions
 
-**A solution contains exactly one order.** One proposal commits to one order, and one settlement carries one proposal and one sub-solver. Batch proposals are out of scope.
+**One proposal commits to one order.** After choosing at most one winning proposal for each order UID, BYOS combines proposals from the same sub-solver into a solution when their clearing-price vectors are compatible by exact integer scaling. Incompatible prices remain separate candidate solutions. Batch proposals and cross-sub-solver settlements are out of scope.
 
-CoW's original single-winner batch auction rewarded batching, because netting opposing orders peer-to-peer was the winning edge. CIP-67 replaced it with the fair combinatorial auction: reference bids are computed per directed token pair, and a batched bid is filtered out if it underperforms the reference on any pair it covers. Coincidence of wants in a single auction is small, most directed pairs carry one order, and a batch usually has nothing to net. Meanwhile sub-solvers are mainly DEXes and routing APIs that want to quote one order and sign one proposal, not build netting logic.
+Each batch preserves its members' trades, gas cuts, hooks, and transfer/Trampoline interaction pairs. Its gas estimate is the sum of the members' estimates. This allows the driver to submit multiple orders through one winning solution without enabling driver-side merging across sub-solvers. Proposal signatures and the EIP-712 schema remain unchanged.
 
-One invariant follows for everything downstream: every BYOS settlement has exactly one order, one trampoline call, one sub-solver. Relaxing it later is a signed-schema change, needing a domain-version bump.
-
-Settlement overhead is therefore paid per order and never amortized, and netting surplus is out of reach. Both are accepted: bids are scored per solution, and BYOS's niche is per-pair routing bids.
+Every solution ID maps to all of its proposal IDs. Outcomes apply to every member. A reverted settlement incurs one transaction-cost-plus-`c_l` debit against its sub-solver; an abandoned solution records one non-settlement penalty. Successful delivery accounting remains per proposal, using each order's `Executed` event.
 
 ### Scoring
 
@@ -873,7 +871,7 @@ The 36h sub-solver window is tight, and sub-solvers without responsive operation
 
 **One sub-solver per settlement transaction.** The per-sub-solver Trampoline CREATE2 address in the settlement calldata self-evidences which sub-solver's route ran, with no reliance on BYOS's private records. That is what makes Track A debits indisputable and Track B attribution clean.
 
-The cost is less batching efficiency.
+Batching is limited to proposals from that sub-solver.
 
 Off-chain, notifications carry auction and solution ids rather than proposals, so attribution to a proposal is a join through the `solutions` mapping the engine writes before bidding ([`#proposal-lifecycle`](#proposal-lifecycle)). The Trampoline address in calldata remains the on-chain proof, checked when debiting.
 
