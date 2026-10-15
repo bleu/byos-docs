@@ -67,7 +67,7 @@ Becoming a CoW solver today is a gated process:
 | Onboarding | Shadow competition and testing on Sepolia before mainnet access | Same requirement |
 | Compliance | KYC through the vouching solver's pool | Same |
 
-An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. BYOS drops the barrier to a collateral deposit sized to cover one worst-case revert penalty (`gas + c_l`) and the ability to sign an EIP-712 message and return a route.
+An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. BYOS drops the barrier to a collateral deposit subject to a flat entry floor and a post-simulation exposure check and the ability to sign an EIP-712 message and return a route.
 
 ### Responsibility split
 
@@ -552,7 +552,7 @@ Every reason a proposal stops competing, grouped by when it happens:
 
 | Reason | Meaning |
 |---|---|
-| Insufficient escrow | Balance below the threshold (`gas estimate × gas price + minimum collateral`) |
+| Insufficient escrow | Balance below the flat minimum, or post-simulation exposure above available collateral (see collateral gates) |
 | Order not found | Order UID not in CoW's orderbook (filled, expired, or cancelled) |
 | Unsupported order | Non-ERC20 balance flavors, bridging orders, or (in v1) partially fillable orders |
 | Amount mismatch | Proposal amounts don't match the order (fill-or-kill mismatch, or partial fill violates limits) |
@@ -803,13 +803,62 @@ CoW's own framework has four enforcement layers ([`reference/cow-solver-slashing
 
 Track A and Track B penalties for the same settlement **stack**. There is no crediting of one against the other: if a settlement causes both a revert and an EBBO ruling, the sub-solver pays both, because the proposal caused both problems.
 
-`c_l` is read from CoW's reward mechanism at debit time, with a hardcoded fallback for v1. Current values: **0.010 ETH** on Ethereum, **10 xDAI** on Gnosis.
+`c_l` follows the deployment policy below and is frozen with auction attribution, rather than recomputed at debit time.
 
-**Minimum escrow balance** is sized to cover worst-case Track A for a single settlement, `gas + c_l`.
+**Minimum escrow balance** is a flat floor; the separate cumulative collateral gate covers simulated gas and penalty exposure as described below.
 
 **On shortfall**, BYOS drains the remaining balance and absorbs the difference. The sub-solver is suspended (zero collateral means ineligible). There is no permanent ban and no debt tracking.
 
-The **policy is immutable for v1**. No unilateral updates; a change requires a v2 policy with a new escrow deployment or a migration.
+The fixed v1 policy is superseded for deployments adopting the collateral-ratio policy through a coordinated service/database migration. Announce the policy and deployment parameters before admitting proposals under it; do not silently reprice historical charges. Further policy changes likewise require an announced migration. Contract immutability is unchanged.
+
+### Collateral gates and deployment penalty cap
+
+The TypeScript service uses a deployment policy inspired by CIP-87:
+
+```
+sellValueNative = floor(sellAmount * sellTokenNativePrice / 10^18)
+c_l = min(floor(sellValueNative * COLLATERAL_RATIO_BPS / 10_000), MIN_COLLATERAL)
+```
+
+`COLLATERAL_RATIO_BPS` defaults to 4 integer basis points. `MIN_COLLATERAL`
+defaults to 10^16 native-token wei and serves as both the minimum escrow floor
+and absolute per-proposal cap. This is a BYOS deployment policy, not an exact
+implementation of CoW's current cap calculation: pair-specific/fractional
+factors, buy-side valuation, and a dynamic USD bound remain deferred.
+
+Gate 1 requires `effectiveBalance >= MIN_COLLATERAL` before simulation. Gate 2
+runs after simulation and requires:
+
+```
+currentExposure + sum(active/executing sibling exposures)
+    <= effectiveBalance - max(outstandingBufferBalance, 0)
+exposure = c_l + simulatedGas * gasPrice
+```
+
+Equality passes. Independent orderbook, database, and balance reads overlap;
+simulation starts after its order data and envelope checks are available. The
+current proposal uses fresh simulated gas on initial validation and every
+revalidation, and is counted once. Unknown sibling gas reserves 200,000 gas;
+legacy unpriced active/executing rows reserve the absolute cap until revalidated.
+Successful production validation always supplies a positive reference price.
+Submitted siblings are excluded. Older active routes replaced by acceptance are
+excluded too; executing routes remain reserved. An unpriced pending replacement
+never invalidates its existing active route. Negative buffer credits offset
+shortfalls only and cannot fund gas or penalties.
+
+Admission is deliberately concurrent, without a per-sub-solver collateral lock.
+Two validations may pass against the same snapshot and activate exposure above
+escrow. BYOS accepts that shortfall risk; this gate is best effort, not a strict
+reservation system. A proposal rejected at Gate 2 has already consumed simulation
+work. Snapshot changes during simulation are part of the same accepted risk.
+
+Each auction solution stores its cap synchronously with attribution before the
+bid is returned. Revert outcomes freeze that cap on the proposal; abandonment
+creates a penalty with its own frozen cap. Later validation prices and auctions
+do not change an existing charge. Validation prices are stored separately from
+auction evidence. Rows predating cap snapshots use the deployment's absolute
+cap as a conservative fallback. Pending penalty evidence survives retention,
+including when a signed debit awaits recovery.
 
 ### Track A
 
@@ -840,7 +889,7 @@ When a proposal uses loose slippage (`minBuyAmount < quoteBuyAmount`) and the se
 
 The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-native-token conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The `solutions` table stores the buy token's reference price at `/solve` time so the penalty job can access it later.
 
-**Buffer accounting is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `buffer_entries` table with its signed native-token amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `c_l`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
+**Buffer accounting is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `buffer_entries` table with its signed native-token amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `MIN_COLLATERAL / 5`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
 
 The threshold prevents gas-inefficient micro-debits on small shortfalls and gives over-deliveries a chance to offset shortfalls within the same clearing cycle. A sub-solver that consistently over-delivers accumulates credits that reduce or eliminate future buffer debits. Over-delivery credits offset future shortfalls but are never paid out — they exist solely to avoid penalizing a sub-solver whose net delivery is on target.
 

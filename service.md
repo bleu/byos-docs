@@ -69,7 +69,7 @@ Runs every ~12 seconds (one block):
 1. **Release stale executing proposals** — proposals stuck in `Executing` for more than 5 minutes (lost notification or restart) fall back to `Active`.
 2. **Expire proposals** — any `Submitted` or `Active` proposal with `validUntil < now` transitions to `Expired`.
 3. **Validate remaining proposals** — for each `Submitted` or `Active` proposal:
-   - **Escrow check** (cheap): `effectiveBalance(subSolver) >= ESCROW_GAS_ESTIMATION × gas_price + min_collateral`, where `ESCROW_GAS_ESTIMATION` is a fixed 200k gas floor. Reject if insufficient.
+   - **Escrow floor** (cheap): require `effectiveBalance(subSolver) >= MIN_COLLATERAL`. After simulation, check cumulative active/executing exposure using fresh simulated gas, the deployment penalty cap, and positive outstanding buffer debt. Exclude submitted siblings and replaced older active routes. Admission is concurrent and may temporarily overcommit collateral; see [collateral gates](design-document#collateral-gates-and-deployment-penalty-cap).
    - **Order envelope check** (no RPC): ERC20 balances only, no bridging orders, amounts consistent with order kind. For sell orders: `order.buyAmount <= minBuyAmount <= quoteBuyAmount`, `quoteBuyAmount` beats the limit price. For buy orders: `minBuyAmount == quoteBuyAmount == order.buyAmount` (hard-reject otherwise). Partially fillable orders use the same constraints against scaled amounts.
    - **Settlement simulation** (expensive): full `settle()` via `eth_estimateGas` with state overrides. Records gas used, trampoline address, and token addresses on success.
    - **Profitability gate** (first validation only): `score = surplus - gas > 0`. Not re-applied on re-validation to avoid gas-price flapping churn.
@@ -80,8 +80,8 @@ A simulation revert is **terminal on first occurrence** — no strikes, no retri
 
 Runs on the same interval as validation. Processes Track A debits and post-settlement buffer accounting:
 
-1. For each `SettleFailed` proposal: fetch settlement tx receipt, compute `gas_used × effective_gas_price + c_l`, call `escrow.debit(subSolver, amount, txHash)`.
-2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × c_l, orderUidHash)`.
+1. For each `SettleFailed` proposal: fetch settlement tx receipt, compute `gas_used × effective_gas_price + frozen c_l`, call `escrow.debit(subSolver, amount, txHash)`.
+2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × frozen c_l, orderUidHash)`.
 3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `solutions` table), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `c_l`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
 4. On success: transition to `Penalized` (for Track A), record the debit tx hash.
 5. Retry up to 10 times on transient failures, then park for operator investigation.
@@ -210,3 +210,9 @@ The per-sub-solver Trampoline CREATE2 address in the calldata identifies which s
 ### Compare-and-swap transitions
 
 All state transitions check the expected current state before updating. Zero rows affected means a concurrent transition won — a cancellation, a notification, or an expiry sweep raced and won. No stale overwrites.
+
+Penalty caps are frozen with auction attribution before bidding. Revalidation
+prices are separate from auction evidence; legacy unsnapshotted events use
+`MIN_COLLATERAL`. Retention preserves unresolved penalty evidence. Buffer clearing
+charges the full net debt only above `MIN_COLLATERAL / 5`; negative credits never
+increase collateral available for gas or Track A penalties.

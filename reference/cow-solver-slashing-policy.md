@@ -1,5 +1,10 @@
 # CoW Protocol Solver Penalty & Slashing Framework
 
+> Historical protocol reference. BYOS's current deployment penalty and collateral
+> policy is specified in [the design document](../design-document#collateral-gates-and-deployment-penalty-cap).
+> Fixed protocol cap figures below do not define current BYOS debits.
+
+
 There are **three enforcement layers**: smart contract (on-chain), automated off-chain (autopilot/driver code), and governance (DAO social consensus).
 
 ---
