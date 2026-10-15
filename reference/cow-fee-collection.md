@@ -1,5 +1,10 @@
 # CoW Protocol — Fee Collection & Enforcement (reference)
 
+> Historical protocol reference. BYOS's current deployment penalty and collateral
+> policy is specified in [the design document](../design-document#collateral-gates-and-deployment-penalty-cap).
+> Fixed protocol cap figures below do not define current BYOS debits.
+
+
 > Consolidated from the official docs, the settlement contract source, and the autopilot code.
 > Captured 2026-07-21 while analyzing fee handling for BYOS. Sources:
 > [settlement contract docs](https://docs.cow.fi/cow-protocol/reference/contracts/core/settlement),
