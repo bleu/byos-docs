@@ -126,11 +126,11 @@ Keep `validUntil` short. BYOS caps it at ingestion ([`#proposal-lifecycle`](../d
 
 ### Contract signers (EIP-1271)
 
-If your sub-solver key is a smart contract (e.g. a Gnosis Safe), include a `subSolverAddress` field in the POST body set to your contract's address. The service tries ECDSA first and falls back to calling `isValidSignature(digest, signature)` on your contract. The `subSolverAddress` is your identity — it is the escrow key and the Trampoline CREATE2 salt — so it must match the address that holds collateral in the Escrow.
+If your sub-solver is a smart contract, set `subSolverAddress` in the POST body to your contract's address. The service tries ECDSA first; if that does not match, it calls `isValidSignature` on your contract. `subSolverAddress` is your identity: it is the escrow key and the Trampoline CREATE2 salt. It must match the address that holds collateral in the Escrow.
 
-The signature can be any byte sequence your contract accepts; it is not limited to 65 bytes. The Trampoline verifies it the same way on-chain (via `SignatureChecker`), so the service and contract are consistent.
+The signature is not limited to 65 bytes. The Trampoline uses `SignatureChecker` on-chain, so service and contract apply identical verification.
 
-**Non-repudiation caveat.** If your signing contract is upgradeable or has a mutable owner set, a third party can verify that a given proposal was submitted but cannot guarantee the authorization is still attributable after the fact. BYOS may require attestation that the signing contract is non-upgradeable in a future version. If dispute resolution matters to you, use a non-upgradeable signer.
+If your contract is upgradeable or has a mutable owner, dispute attribution may not hold after the fact. Use a non-upgradeable signer if dispute resolution matters.
 
 ## 6. Submit and poll
 
