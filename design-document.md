@@ -67,7 +67,7 @@ Becoming a CoW solver today is a gated process:
 | Onboarding | Shadow competition and testing on Sepolia before mainnet access | Same requirement |
 | Compliance | KYC through the vouching solver's pool | Same |
 
-An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. BYOS drops the barrier to a collateral deposit sized to cover one worst-case revert penalty (`gas + c_l`) and the ability to sign an EIP-712 message and return a route.
+An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. BYOS drops the barrier to a collateral deposit subject to a flat entry floor and a post-simulation exposure check and the ability to sign an EIP-712 message and return a route.
 
 ### Responsibility split
 
@@ -386,7 +386,7 @@ Eip712Domain {
 
 **`interactionsHash` is required.** Without it, BYOS could substitute different interactions while presenting the same signed amounts, then blame the sub-solver for the resulting revert. The Trampoline verifies `keccak256(abi.encode(interactions)) == interactionsHash` before executing, so substituted interactions fail signature verification. This differs from CoW order signatures, which do not sign interactions, because the threat model is inverted: sub-solvers need protection against the operator, not against the execution path.
 
-**There is no `escrow_account` field.** The recovered signer address *is* the escrow key, and the Trampoline CREATE2 salt. One address is load-bearing three ways. Delegation — sign with key K, collateral from account E — would complicate the Escrow's dumb-ledger design and is a v2 concern. A sub-solver running multiple strategies deposits separately per address. Key rotation moves collateral by ERC20 transfer ([`#withdrawal-and-freeze`](#withdrawal-and-freeze)) and gets a new Trampoline instance.
+**There is no `escrow_account` field.** The sub-solver address is the escrow key and the Trampoline CREATE2 salt. For EOA sub-solvers it is recovered from the signature via `ecrecover`. For contract sub-solvers it is the `subSolverAddress` declared in the POST body and verified on-chain via EIP-1271. Either way, one address is load-bearing three ways. Delegation — sign with key K, collateral from account E — would complicate the Escrow's dumb-ledger design and is a v2 concern. A sub-solver running multiple strategies deposits separately per address. Key rotation moves collateral by ERC20 transfer ([`#withdrawal-and-freeze`](#withdrawal-and-freeze)) and gets a new Trampoline instance.
 
 **The nonce is a unique salt, enforced on-chain.** Each Trampoline instance tracks used nonces in a `mapping(uint256 => bool)`. Any `uint256` is valid as long as it has not been consumed; there is no ordering rule. On-chain nonce enforcement provides hard replay protection independent of BYOS trust, at the cost of 20k gas for the first use of each nonce. Fill tracking alone would not prevent replay of `execute`, since a settlement need not include the order at all, so a third party could rerun a live proposal in a tradeless settlement. Third-party replay is additionally blocked by the submitter gate ([`#execution-authority`](#execution-authority)). Replay by BYOS's own submitter is prevented by the nonce check; `validUntil` further bounds the window.
 
@@ -409,7 +409,7 @@ The public HTTP surface by which sub-solvers submit signed proposals. Field-leve
 
 `POST` carries `sellToken` and `buyToken` because they are part of the EIP-712 signed struct. The service validates them against the orderbook order during proposal validation.
 
-**The recovered signer is the identity.** There are no API keys, sessions, or accounts. Callers are sub-solver servers over TLS, not browsers.
+**The verified signer is the identity.** There are no API keys, sessions, or accounts. For EOA sub-solvers the identity is recovered from the ECDSA signature via `ecrecover`. For contract sub-solvers the identity is the `subSolverAddress` declared in the POST body, verified by calling `isValidSignature` on-chain. Either way, the address drives escrow lookups, rate-limit tiers, and Trampoline CREATE2. Callers are sub-solver servers over TLS, not browsers.
 
 **Every read is authenticated and owner-scoped.** GET endpoints require an EIP-712 signature in the `X-Signature` header, and the recovered signer scopes the response — competitors' proposals are invisible, and even "which addresses are competing on which order" does not leak. The signed message is a dedicated type owned by the service and never verified on-chain:
 
@@ -435,7 +435,7 @@ Proposals are immutable, so there is no update operation and no `PUT`. Replaceme
 
 **Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `202 Accepted` and creates no row, audit event, or replacement. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, so there is no unsigned replacement-intent field.
 
-**Ingestion is asynchronous.** The request path does three things inline: parse, `ecrecover`, and check the expiry window. On first use of a nonce, the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted". Signature and expiry-window failures reject synchronously with a typed 4xx, since there is no point storing and auditing a proposal that is dead on arrival. All on-chain work, the escrow balance check and simulation, runs in a background validator loop ([`#proposal-lifecycle`](#proposal-lifecycle)). Sub-solvers poll for the verdict, and a rejection carries a machine-readable typed reason.
+**Ingestion is asynchronous.** The request path does three things inline: parse, verify the proposal signature, and check the expiry window. For EOA sub-solvers signature verification is a pure `ecrecover`. For contract sub-solvers (`subSolverAddress` present) it tries `ecrecover` first and, if that does not match the declared address, makes one `eth_call` to `isValidSignature` on the contract. On first use of a nonce, the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted". Signature and expiry-window failures reject synchronously with a typed 4xx, since there is no point storing and auditing a proposal that is dead on arrival. All other on-chain work, the escrow balance check and simulation, runs in a background validator loop ([`#proposal-lifecycle`](#proposal-lifecycle)). Sub-solvers poll for the verdict, and a rejection carries a machine-readable typed reason.
 
 That means a `2xx` from `POST` is not acceptance. Integration code that treats it as acceptance is wrong. Verdict latency is bounded by the validator tick interval, not by the request round-trip.
 
@@ -446,7 +446,7 @@ The reject-early pipeline, split across the sync and async boundary:
 | # | Stage | Where |
 |---|---|---|
 | 1 | IP filter | edge (CDN), with a loose in-app backstop |
-| 2 | Parse + `ecrecover` | request path |
+| 2 | Parse + signature verification (`ecrecover` for EOAs; `isValidSignature` for contracts) | request path |
 | 3 | Expiry-window check | request path |
 | 4 | Signer rate limit | request path |
 | 5 | Cached escrow floor gate (submission only) | request path |
@@ -552,7 +552,7 @@ Every reason a proposal stops competing, grouped by when it happens:
 
 | Reason | Meaning |
 |---|---|
-| Insufficient escrow | Balance below the threshold (`gas estimate × gas price + minimum collateral`) |
+| Insufficient escrow | Balance below the flat minimum, or post-simulation exposure above available collateral (see collateral gates) |
 | Order not found | Order UID not in CoW's orderbook (filled, expired, or cancelled) |
 | Unsupported order | Non-ERC20 balance flavors, bridging orders, or (in v1) partially fillable orders |
 | Amount mismatch | Proposal amounts don't match the order (fill-or-kill mismatch, or partial fill violates limits) |
@@ -803,13 +803,62 @@ CoW's own framework has four enforcement layers ([`reference/cow-solver-slashing
 
 Track A and Track B penalties for the same settlement **stack**. There is no crediting of one against the other: if a settlement causes both a revert and an EBBO ruling, the sub-solver pays both, because the proposal caused both problems.
 
-`c_l` is read from CoW's reward mechanism at debit time, with a hardcoded fallback for v1. Current values: **0.010 ETH** on Ethereum, **10 xDAI** on Gnosis.
+`c_l` follows the deployment policy below and is frozen with auction attribution, rather than recomputed at debit time.
 
-**Minimum escrow balance** is sized to cover worst-case Track A for a single settlement, `gas + c_l`.
+**Minimum escrow balance** is a flat floor; the separate cumulative collateral gate covers simulated gas and penalty exposure as described below.
 
 **On shortfall**, BYOS drains the remaining balance and absorbs the difference. The sub-solver is suspended (zero collateral means ineligible). There is no permanent ban and no debt tracking.
 
-The **policy is immutable for v1**. No unilateral updates; a change requires a v2 policy with a new escrow deployment or a migration.
+The fixed v1 policy is superseded for deployments adopting the collateral-ratio policy through a coordinated service/database migration. Announce the policy and deployment parameters before admitting proposals under it; do not silently reprice historical charges. Further policy changes likewise require an announced migration. Contract immutability is unchanged.
+
+### Collateral gates and deployment penalty cap
+
+The TypeScript service uses a deployment policy inspired by CIP-87:
+
+```
+sellValueNative = floor(sellAmount * sellTokenNativePrice / 10^18)
+c_l = min(floor(sellValueNative * COLLATERAL_RATIO_BPS / 10_000), MIN_COLLATERAL)
+```
+
+`COLLATERAL_RATIO_BPS` defaults to 4 integer basis points. `MIN_COLLATERAL`
+defaults to 10^16 native-token wei and serves as both the minimum escrow floor
+and absolute per-proposal cap. This is a BYOS deployment policy, not an exact
+implementation of CoW's current cap calculation: pair-specific/fractional
+factors, buy-side valuation, and a dynamic USD bound remain deferred.
+
+Gate 1 requires `effectiveBalance >= MIN_COLLATERAL` before simulation. Gate 2
+runs after simulation and requires:
+
+```
+currentExposure + sum(active/executing sibling exposures)
+    <= effectiveBalance - max(outstandingBufferBalance, 0)
+exposure = c_l + simulatedGas * gasPrice
+```
+
+Equality passes. Independent orderbook, database, and balance reads overlap;
+simulation starts after its order data and envelope checks are available. The
+current proposal uses fresh simulated gas on initial validation and every
+revalidation, and is counted once. Unknown sibling gas reserves 200,000 gas;
+legacy unpriced active/executing rows reserve the absolute cap until revalidated.
+Successful production validation always supplies a positive reference price.
+Submitted siblings are excluded. Older active routes replaced by acceptance are
+excluded too; executing routes remain reserved. An unpriced pending replacement
+never invalidates its existing active route. Negative buffer credits offset
+shortfalls only and cannot fund gas or penalties.
+
+Admission is deliberately concurrent, without a per-sub-solver collateral lock.
+Two validations may pass against the same snapshot and activate exposure above
+escrow. BYOS accepts that shortfall risk; this gate is best effort, not a strict
+reservation system. A proposal rejected at Gate 2 has already consumed simulation
+work. Snapshot changes during simulation are part of the same accepted risk.
+
+Each auction solution stores its cap synchronously with attribution before the
+bid is returned. Revert outcomes freeze that cap on the proposal; abandonment
+creates a penalty with its own frozen cap. Later validation prices and auctions
+do not change an existing charge. Validation prices are stored separately from
+auction evidence. Rows predating cap snapshots use the deployment's absolute
+cap as a conservative fallback. Pending penalty evidence survives retention,
+including when a signed debit awaits recovery.
 
 ### Track A
 
@@ -840,7 +889,7 @@ When a proposal uses loose slippage (`minBuyAmount < quoteBuyAmount`) and the se
 
 The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-native-token conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The `solutions` table stores the buy token's reference price at `/solve` time so the penalty job can access it later.
 
-**Buffer accounting is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `buffer_entries` table with its signed native-token amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `c_l`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
+**Buffer accounting is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `buffer_entries` table with its signed native-token amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `MIN_COLLATERAL / 5`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
 
 The threshold prevents gas-inefficient micro-debits on small shortfalls and gives over-deliveries a chance to offset shortfalls within the same clearing cycle. A sub-solver that consistently over-delivers accumulates credits that reduce or eliminate future buffer debits. Over-delivery credits offset future shortfalls but are never paid out — they exist solely to avoid penalizing a sub-solver whose net delivery is on target.
 
