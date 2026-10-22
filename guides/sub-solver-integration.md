@@ -73,7 +73,7 @@ One proposal covers one order ([`#single-order-solutions`](../design-document#si
 
 Orders appear in CoW's orderbook only after BYOS receives them from the driver in `/solve`. Do not poll the orderbook before a `/solve` call has arrived — the orders will not be there yet.
 
-A proposal is valid for one auction window only. It does not carry over to the next auction. When BYOS sends its solution to the driver, the auction window closes. Any proposal that arrives after that point is rejected.
+A proposal is valid for one auction window only. It does not carry over to the next auction. When BYOS sends its solution to the driver, the auction window closes. Proposals that were already submitted but not yet validated at that point are asynchronously rejected with reason `AuctionClosed`. New POST /proposals requests after the window closes receive `400 noActiveAuction`, because there is no active auction to accept them.
 
 If an order was not filled in the current auction, submit a new proposal when the next auction opens.
 
@@ -150,7 +150,7 @@ All endpoints are on the public listener (default port 9585):
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `202` with an id. Replaying identical signed content returns the original id; reusing its nonce with different signed content returns `409 NonceAlreadyUsed`. This is **not** acceptance. Returns `400` with `noActiveAuction` if no `/solve` has arrived yet, `unknownOrder` if the order UID is not in the current auction, or `AuctionClosed` if the auction window has already closed. |
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `202` with an id. Replaying identical signed content returns the original id; reusing its nonce with different signed content returns `409 NonceAlreadyUsed`. This is **not** acceptance. Returns `400` with `noActiveAuction` if no `/solve` has arrived yet, or `unknownOrder` if the order UID is not in the current auction. |
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
@@ -189,13 +189,13 @@ To cancel a proposal before it settles, send a signed `DELETE` request. Proposal
 | Rejected at gatekeeping | None | Read the typed rejection reason. Fix the route or the amounts. |
 | `400 noActiveAuction` | None | No `/solve` has arrived yet. BYOS just started or is between auctions. Wait for the next auction and resubmit. |
 | `400 unknownOrder` | None | The order UID is not in the current auction. The order may not have reached BYOS yet. Wait for the next auction. |
-| `400 AuctionClosed` | None | The auction window has closed. BYOS already responded to `/solve`. Submit in the next auction. |
 | Simulation reverted | None (one rate-limit slot used) | The proposal is dropped on the first revert. There are no retries. Resubmit if the route is still valid. |
 | `429` rate limited | None | You are over your budget. Wait out `Retry-After`. Deposit more escrow for a larger budget. |
 | `503` service unavailable | None | A BYOS dependency is down. Wait out `Retry-After` and retry; nothing was lost. |
 | `409 NonceAlreadyUsed` | None | The nonce was already used for different signed content. Generate a new nonce; retrying the exact same signed proposal is safe and returns its original id. |
 | `403` insufficient escrow | None | Your cached balance is below the minimum collateral. Deposit more. Submission only — reads and cancellations keep working. |
 | Expired | None | Your `validUntil` passed. Use a shorter interval. |
+| `AuctionClosed` | None | The auction closed before your already-submitted proposal was validated. Submit a new proposal in the next auction. |
 | `SubsolverOutbid` | None | BYOS selected a different sub-solver for this order. Resubmit with a better route for the next auction. |
 | `SolverOutbid` | None | BYOS won the internal competition but an external solver settled the order first. Resubmit or move to the next order. |
 | Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
