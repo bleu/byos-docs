@@ -31,7 +31,7 @@ flowchart LR
     DB -->|no active auction| R202[202 + id]
 ```
 
-The request path parses the proposal, verifies the signature, checks the expiry window, and runs escrow and simulation validation synchronously. A `200` response means the proposal is active in the current auction. A `400` response means it was rejected with a typed reason. A `202` response means the proposal was stored but no active auction is running.
+The request path parses the proposal, verifies the signature, checks the expiry window, and runs escrow and simulation validation synchronously. A `200` response means the proposal is active in the current auction. A `400 noActiveAuction` response means no auction is running (proposal not stored). A `400 ProposalRejected` response means validation failed with a typed reason. A `202` response means the proposal was stored but the auction closed between the initial check and validation — resubmit when the next auction opens.
 
 For EOA sub-solvers the signature verification is a pure `ecrecover` — no RPC, no state. For contract sub-solvers (`subSolverAddress` present in the POST body) the service tries `ecrecover` first; if that does not match the declared address it falls back to one `eth_call` invoking `isValidSignature` on the contract. See [`#proposal-schema`](#proposal-schema).
 
@@ -173,7 +173,7 @@ Rationale for each decision lives in the ADRs of [byos-service](https://github.c
 
 ### Sync ingestion
 
-The request path validates proposals synchronously (escrow + simulation). A `200` means active; `400` means rejected. `202` means stored but no active auction is running.
+The request path validates proposals synchronously (escrow + simulation). A `200` means active; `400 noActiveAuction` means no auction is running and the proposal is not stored; `400 ProposalRejected` means validation failed with a typed reason. `202` is a rare race-condition case: the proposal was stored but the auction closed before validation completed.
 
 ### No chain watcher
 

@@ -150,7 +150,7 @@ All endpoints are on the public listener (default port 9585):
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `200 {"id": n, "status": "active"}` if the proposal passes validation, `400` with a typed rejection reason if it fails, or `202` with an id if no active auction is running. Replaying identical signed content returns the original id without re-validating; reusing a nonce with different signed content returns `409 NonceAlreadyUsed`. Returns `400 unknownOrder` if the order UID is not in the current auction. |
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `200 {"id": n, "status": "active"}` if validation passes; `400 ProposalRejected` with a typed `reason` if validation fails; `400 noActiveAuction` if no auction is running (proposal not stored); `400 unknownOrder` if the order UID is not in the current auction; `202` in the rare case where the proposal was stored but the auction closed before validation ran. Replaying identical signed content returns the original id with `202`; reusing a nonce with different content returns `409 NonceAlreadyUsed`. |
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
@@ -166,7 +166,7 @@ If you query a proposal that is not yours, you get `404` (not `403`). You cannot
 
 ### The POST response is the verdict
 
-BYOS validates proposals synchronously on the request path. A `200` response with `{"id": n, "status": "active"}` means the proposal passed escrow and simulation checks and is live in the current auction. A `400` response means it was rejected — read the typed reason and fix the route or amounts. A `202` response means the proposal was stored but no active auction is running; resubmit when the next auction opens.
+BYOS validates proposals synchronously on the request path. A `200` response with `{"id": n, "status": "active"}` means the proposal passed escrow and simulation checks and is live in the current auction. A `400 ProposalRejected` response means validation failed — read the typed `reason` and fix the route or amounts. A `400 noActiveAuction` response means no auction is running and the proposal was not stored. A `202` response is a rare race case: the proposal was stored but the auction closed before validation ran; resubmit when the next auction opens.
 
 ### Poll for state changes
 
