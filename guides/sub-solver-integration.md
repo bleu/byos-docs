@@ -73,7 +73,7 @@ One proposal covers one order ([`#single-order-solutions`](../design-document#si
 
 Orders appear in CoW's orderbook only after BYOS receives them from the driver in `/solve`. Do not poll the orderbook before a `/solve` call has arrived — the orders will not be there yet.
 
-A proposal is valid for one auction window only. It does not carry over to the next auction. When BYOS sends its solution to the driver, the auction window closes. Proposals that were already submitted but not yet validated at that point are asynchronously rejected with reason `AuctionClosed`. New POST /proposals requests after the window closes receive `400 noActiveAuction`, because there is no active auction to accept them.
+A proposal is valid for one auction window only. It does not carry over to the next auction. When BYOS sends its solution to the driver, the auction window closes. Proposals that were `Submitted` or `Active` at that point are cancelled with reason `AuctionClosed`. New POST /proposals requests after the window closes receive `202` until the next auction arrives.
 
 If an order was not filled in the current auction, submit a new proposal when the next auction opens.
 
@@ -150,7 +150,7 @@ All endpoints are on the public listener (default port 9585):
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `202` with an id. Replaying identical signed content returns the original id; reusing its nonce with different signed content returns `409 NonceAlreadyUsed`. This is **not** acceptance. Returns `400` with `noActiveAuction` if no `/solve` has arrived yet, or `unknownOrder` if the order UID is not in the current auction. |
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `200 {"id": n, "status": "active"}` if the proposal passes validation, `400` with a typed rejection reason if it fails, or `202` with an id if no active auction is running. Replaying identical signed content returns the original id without re-validating; reusing a nonce with different signed content returns `409 NonceAlreadyUsed`. Returns `400 unknownOrder` if the order UID is not in the current auction. |
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
@@ -164,13 +164,13 @@ Sign an EIP-712 `ReadAuth { version: 1 }` message once. Send it in the `X-Signat
 
 If you query a proposal that is not yours, you get `404` (not `403`). You cannot check if a proposal id exists.
 
-### The response to POST is not acceptance
+### The POST response is the verdict
 
-A `2xx` response means "accepted for validation". BYOS stores the proposal as `Submitted` and returns an id. Escrow checks and simulation run in a background loop ([`#proposal-api`](../design-document#proposal-api)). Do not treat a `2xx` as "my proposal is live".
+BYOS validates proposals synchronously on the request path. A `200` response with `{"id": n, "status": "active"}` means the proposal passed escrow and simulation checks and is live in the current auction. A `400` response means it was rejected — read the typed reason and fix the route or amounts. A `202` response means the proposal was stored but no active auction is running; resubmit when the next auction opens.
 
-### Poll for the verdict
+### Poll for state changes
 
-After you submit, poll for the verdict with `GET /proposal/{id}`. You can see only your own proposals. Expect a verdict within approximately one block. The validator tick interval determines the latency, not the request round-trip. See [SLO targets](../operations/slo-targets).
+Use `GET /proposal/{id}` to track what happens after acceptance: when the proposal moves to `Executing`, `Settled`, or `Cancelled` (replaced by a newer proposal, or closed at auction end).
 
 A proposal is valid for the current auction window only. When BYOS closes the auction, the proposal does not carry over. If the order was not filled, submit a new proposal in the next auction.
 
@@ -195,7 +195,7 @@ To cancel a proposal before it settles, send a signed `DELETE` request. Proposal
 | `409 NonceAlreadyUsed` | None | The nonce was already used for different signed content. Generate a new nonce; retrying the exact same signed proposal is safe and returns its original id. |
 | `403` insufficient escrow | None | Your cached balance is below the minimum collateral. Deposit more. Submission only — reads and cancellations keep working. |
 | Expired | None | Your `validUntil` passed. Use a shorter interval. |
-| `AuctionClosed` | None | The auction closed before your already-submitted proposal was validated. Submit a new proposal in the next auction. |
+| `AuctionClosed` | None | The auction closed while your proposal was active. Submit a new proposal in the next auction. |
 | `SubsolverOutbid` | None | BYOS selected a different sub-solver for this order. Resubmit with a better route for the next auction. |
 | `SolverOutbid` | None | BYOS won the internal competition but an external solver settled the order first. Resubmit or move to the next order. |
 | Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
@@ -204,7 +204,7 @@ To cancel a proposal before it settles, send a signed `DELETE` request. Proposal
 
 ### Rate limits: `429` and `503`
 
-Your requests share one budget across `POST`, `GET` and `DELETE`, scaled by your escrow balance. A larger deposit buys more throughput. Size your polling against the budget, not against the tick interval: polling every live proposal on a short tick is what consumes it, and writes are cheap by comparison.
+Your requests share one budget across `POST`, `GET` and `DELETE`, scaled by your escrow balance. A larger deposit buys more throughput. Size your polling against the budget: polling every live proposal on a short interval is what consumes it, and writes are cheap by comparison.
 
 A `429` means you exceeded that budget, or the per-IP limit in front of it. A `503` means a store BYOS depends on is unreachable — infrastructure, not load. The two are deliberately separate so you can tell them apart in your own logs.
 
