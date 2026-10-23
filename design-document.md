@@ -386,7 +386,7 @@ Eip712Domain {
 
 **`interactionsHash` is required.** Without it, BYOS could substitute different interactions while presenting the same signed amounts, then blame the sub-solver for the resulting revert. The Trampoline verifies `keccak256(abi.encode(interactions)) == interactionsHash` before executing, so substituted interactions fail signature verification. This differs from CoW order signatures, which do not sign interactions, because the threat model is inverted: sub-solvers need protection against the operator, not against the execution path.
 
-**There is no `escrow_account` field.** The recovered signer address *is* the escrow key, and the Trampoline CREATE2 salt. One address is load-bearing three ways. Delegation — sign with key K, collateral from account E — would complicate the Escrow's dumb-ledger design and is a v2 concern. A sub-solver running multiple strategies deposits separately per address. Key rotation moves collateral by ERC20 transfer ([`#withdrawal-and-freeze`](#withdrawal-and-freeze)) and gets a new Trampoline instance.
+**There is no `escrow_account` field.** The sub-solver address is the escrow key and the Trampoline CREATE2 salt. For EOA sub-solvers, it is recovered from the signature via `ecrecover`. For contract sub-solvers, it is the `subSolverAddress` field, verified on-chain via EIP-1271. One address is load-bearing three ways. Delegation — sign with key K, collateral from account E — would complicate the Escrow's dumb-ledger design and is a v2 concern. A sub-solver running multiple strategies deposits separately per address. Key rotation moves collateral by ERC20 transfer ([`#withdrawal-and-freeze`](#withdrawal-and-freeze)) and gets a new Trampoline instance.
 
 **The nonce is a unique salt, enforced on-chain.** Each Trampoline instance tracks used nonces in a `mapping(uint256 => bool)`. Any `uint256` is valid as long as it has not been consumed; there is no ordering rule. On-chain nonce enforcement provides hard replay protection independent of BYOS trust, at the cost of 20k gas for the first use of each nonce. Fill tracking alone would not prevent replay of `execute`, since a settlement need not include the order at all, so a third party could rerun a live proposal in a tradeless settlement. Third-party replay is additionally blocked by the submitter gate ([`#execution-authority`](#execution-authority)). Replay by BYOS's own submitter is prevented by the nonce check; `validUntil` further bounds the window.
 
@@ -409,7 +409,7 @@ The public HTTP surface by which sub-solvers submit signed proposals. Field-leve
 
 `POST` carries `sellToken` and `buyToken` because they are part of the EIP-712 signed struct. The service validates them against the orderbook order during proposal validation.
 
-**The recovered signer is the identity.** There are no API keys, sessions, or accounts. Callers are sub-solver servers over TLS, not browsers.
+**The verified signer is the identity.** There are no API keys, sessions, or accounts. For EOA sub-solvers, the address is recovered from the signature via `ecrecover`. For contract sub-solvers, the address is the `subSolverAddress` field, verified on-chain via `isValidSignature`. The address drives escrow lookups, rate-limit tiers, and Trampoline CREATE2. Callers are sub-solver servers over TLS, not browsers.
 
 **Every read is authenticated and owner-scoped.** GET endpoints require an EIP-712 signature in the `X-Signature` header, and the recovered signer scopes the response — competitors' proposals are invisible, and even "which addresses are competing on which order" does not leak. The signed message is a dedicated type owned by the service and never verified on-chain:
 
@@ -435,7 +435,7 @@ Proposals are immutable, so there is no update operation and no `PUT`. Replaceme
 
 **Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `202 Accepted` and creates no row, audit event, or replacement. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, so there is no unsigned replacement-intent field.
 
-**Ingestion is asynchronous.** The request path does three things inline: parse, `ecrecover`, and check the expiry window. On first use of a nonce, the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted". Signature and expiry-window failures reject synchronously with a typed 4xx, since there is no point storing and auditing a proposal that is dead on arrival. All on-chain work, the escrow balance check and simulation, runs in a background validator loop ([`#proposal-lifecycle`](#proposal-lifecycle)). Sub-solvers poll for the verdict, and a rejection carries a machine-readable typed reason.
+**Ingestion is asynchronous.** The request path does three things inline: parse, verify the proposal signature, and check the expiry window. For EOA sub-solvers, verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. On first use of a nonce, the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted". Signature and expiry-window failures reject synchronously with a typed 4xx, since there is no point storing and auditing a proposal that is dead on arrival. All other on-chain work, the escrow balance check and simulation, runs in a background validator loop ([`#proposal-lifecycle`](#proposal-lifecycle)). Sub-solvers poll for the verdict, and a rejection carries a machine-readable typed reason.
 
 That means a `2xx` from `POST` is not acceptance. Integration code that treats it as acceptance is wrong. Verdict latency is bounded by the validator tick interval, not by the request round-trip.
 
@@ -446,7 +446,7 @@ The reject-early pipeline, split across the sync and async boundary:
 | # | Stage | Where |
 |---|---|---|
 | 1 | IP filter | edge (CDN), with a loose in-app backstop |
-| 2 | Parse + `ecrecover` | request path |
+| 2 | Parse + signature verification (`ecrecover` for EOAs; `isValidSignature` for contracts) | request path |
 | 3 | Expiry-window check | request path |
 | 4 | Signer rate limit | request path |
 | 5 | Cached escrow floor gate (submission only) | request path |

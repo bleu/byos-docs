@@ -124,6 +124,14 @@ The `interactionsHash` field in the signed struct commits to your route. BYOS ca
 
 Keep `validUntil` short. BYOS caps it at ingestion ([`#proposal-lifecycle`](../design-document#proposal-lifecycle)). A route that is more than a few minutes old is stale.
 
+### Contract signers (EIP-1271)
+
+If your sub-solver is a smart contract, set `subSolverAddress` in the POST body to your contract's address. The service tries ECDSA first; if that does not match, it calls `isValidSignature` on your contract. `subSolverAddress` is your identity: it is the escrow key and the Trampoline CREATE2 salt. It must match the address that holds collateral in the Escrow.
+
+The signature is not limited to 65 bytes. The Trampoline uses `SignatureChecker` on-chain, so service and contract apply identical verification.
+
+If your contract is upgradeable or has a mutable owner, dispute attribution may not hold after the fact. Use a non-upgradeable signer if dispute resolution matters.
+
 ## 6. Submit and poll
 
 Send a `POST` request with the proposal. See the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for the payload format, status codes, and rejection reasons.

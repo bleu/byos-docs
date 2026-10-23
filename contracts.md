@@ -149,7 +149,7 @@ Only callable when all gates pass:
 2. `tx.origin` holds `SUBMITTER_ROLE` on the Escrow — must be BYOS's submitter, not a rival solver replaying public calldata.
 3. `block.timestamp <= proposal.validUntil` — proposal not expired.
 4. `proposal.nonce` not previously used — replay protection.
-5. EIP-712 signature over `ProposalData + interactionsHash` recovers to `SUB_SOLVER` — proves the sub-solver consented to this exact route and token pair.
+5. EIP-712 signature over `ProposalData + interactionsHash` is valid for `SUB_SOLVER` — verified via ECDSA `ecrecover` when `SUB_SOLVER` is an EOA, or via EIP-1271 `isValidSignature` when `SUB_SOLVER` is a contract — proves the sub-solver consented to this exact route and token pair.
 
 Then:
 1. Records `GPv2Settlement`'s current buy-token balance.
