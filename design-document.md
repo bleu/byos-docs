@@ -435,13 +435,11 @@ Proposals are immutable, so there is no update operation and no `PUT`. Replaceme
 
 **Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `202 Accepted` and creates no row, audit event, or replacement. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, so there is no unsigned replacement-intent field.
 
-**Ingestion is asynchronous.** The request path does three things inline: parse, verify the proposal signature, and check the expiry window. For EOA sub-solvers, verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. On first use of a nonce, the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted". Signature and expiry-window failures reject synchronously with a typed 4xx, since there is no point storing and auditing a proposal that is dead on arrival. All other on-chain work, the escrow balance check and simulation, runs in a background validator loop ([`#proposal-lifecycle`](#proposal-lifecycle)). Sub-solvers poll for the verdict, and a rejection carries a machine-readable typed reason.
-
-That means a `2xx` from `POST` is not acceptance. Integration code that treats it as acceptance is wrong. Verdict latency is bounded by the validator tick interval, not by the request round-trip.
+**Ingestion is synchronous.** The request path validates proposals inline: parse, verify the signature, check the expiry window, then run the escrow check and settlement simulation. For EOA sub-solvers, signature verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. A `200` response means the proposal passed all checks and is `Active` in the current auction. A `400 ProposalRejected` means it failed; the `reason` field carries the typed rejection reason. A `202` means the proposal was stored as `Submitted` but no active auction is running — the sub-solver should resubmit when the next auction opens.
 
 **Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and a signer known to be below the minimum escrow is rejected once a balance is known. That rejection applies to submission only: effective escrow balance reads as zero from the moment a sub-solver requests a withdrawal, so gating reads and cancellations too would leave a sub-solver winding down unable to cancel, or even see, the proposals it still has live. An address the service has not seen before is admitted at the lowest tier rather than rejected, since absence of a cached balance is not evidence of an empty one. The escrow balance behind the second layer is cached so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
 
-The reject-early pipeline, split across the sync and async boundary:
+The reject-early pipeline, all on the request path:
 
 | # | Stage | Where |
 |---|---|---|
@@ -450,8 +448,8 @@ The reject-early pipeline, split across the sync and async boundary:
 | 3 | Expiry-window check | request path |
 | 4 | Signer rate limit | request path |
 | 5 | Cached escrow floor gate (submission only) | request path |
-| 6 | Authoritative escrow balance check (RPC) | background validator |
-| 7 | Gatekeeping + simulation | background validator |
+| 6 | Authoritative escrow balance check (RPC) | request path |
+| 7 | Gatekeeping + simulation | request path |
 
 Stage 1 sits at the edge because a request rejected there costs no socket, no `ecrecover`, and no connection-pool slot. That depends on the origin being unreachable except through the CDN; otherwise the forwarded client-IP header is attacker-controlled and anything keyed on it is poisoned. The in-app backstop defends against that misconfiguration, not against an attacker who beat the edge.
 
@@ -467,16 +465,13 @@ The write-behind leaves a small crash window: an audit event is emitted only aft
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Submitted: POST /proposals
-    Submitted --> Active: first simulation passes,\nscore > 0
-    Submitted --> Rejected: gatekeeping fails\n(escrow, envelope, unprofitable, ...)
-    Submitted --> SimFailed: simulation reverts
-    Active --> Active: re-simulation each tick\n(updates gas)
-    Active --> SimFailed: re-simulation reverts
-    Active --> Rejected: escrow re-check fails
+    [*] --> Submitted: POST /proposals\n(no active auction)
+    Submitted --> Active: POST /proposals\nsimulation passes, score > 0
+    Submitted --> Rejected: POST /proposals\ngatekeeping fails\n(escrow, envelope, unprofitable, ...)
+    Submitted --> SimFailed: POST /proposals\nsimulation reverts
     Active --> Executing: driver SettlementStarted
-    Submitted --> Cancelled: newer proposal activates
-    Active --> Cancelled: newer proposal activates
+    Submitted --> Cancelled: newer proposal activates\nor AuctionClosed
+    Active --> Cancelled: newer proposal activates\nor AuctionClosed
     Submitted --> Expired: validUntil passed
     Active --> Expired: validUntil passed
     Submitted --> Cancelled: DELETE /proposals/{id}
@@ -493,8 +488,8 @@ A state answers exactly one question: what does the service do with this proposa
 
 | State | Simulated | Offered to `/solve` | Expiry sweep | Cancellable | Retention |
 |---|---|---|---|---|---|
-| `Submitted` | first pass | no | yes | yes | live |
-| `Active` | every tick | yes | yes | yes | live |
+| `Submitted` | inline on POST | no | yes | yes | live |
+| `Active` | no | yes | yes | yes | live |
 | `Executing` | no | no | no | no | live |
 | `Rejected` | no | no | — | no | 1 hour |
 | `SimFailed` | no | no | — | no | 1 hour |
@@ -508,15 +503,12 @@ Every transition:
 
 | From | To | Trigger |
 |---|---|---|
-| — | `Submitted` | `POST /proposals`: signature verified, expiry window OK. |
-| `Submitted` | `Active` | First validation passes: escrow check, envelope check, simulation succeeds, score > 0. Writes gas, trampoline address, token addresses. |
-| `Submitted` | `Rejected` | A gatekeeping rule fails: insufficient escrow, unsupported order, amount mismatch, order not found, or unprofitable. Carries the typed reason. |
-| `Submitted` | `SimFailed` | First simulation reverts. |
-| `Active` | `Active` | Re-validation tick refreshes the gas estimate. No status change, no audit event. |
-| `Active` | `Rejected` | Escrow re-check fails; the balance dropped below the threshold. |
-| `Active` | `SimFailed` | Re-simulation reverts: the order filled or expired on-chain, the route broke, balances moved. |
+| — | `Submitted` | `POST /proposals` when no active auction is running: signature verified, expiry window OK. |
+| `Submitted` | `Active` | `POST /proposals` during an active auction: escrow check, envelope check, simulation succeeds, score > 0. Writes gas, trampoline address, token addresses. |
+| `Submitted` | `Rejected` | `POST /proposals`: a gatekeeping rule fails — insufficient escrow, unsupported order, amount mismatch, order not found, or unprofitable. Carries the typed reason. Also on `AuctionClosed` when the auction window closes. |
+| `Submitted` | `SimFailed` | `POST /proposals`: simulation reverts. Terminal on first occurrence. |
 | `Submitted`, `Active` | `Expired` | `validUntil` is behind the clock. |
-| `Submitted`, `Active` | `Cancelled` | Signed `DELETE` by the owner, or a newer proposal for the same `(subSolver, orderUid)` validates and activates. `DELETE` against any other state is a 409. |
+| `Submitted`, `Active` | `Cancelled` | Signed `DELETE` by the owner, or a newer proposal for the same `(subSolver, orderUid)` validates and activates. `DELETE` against any other state is a 409. Also on `AuctionClosed` for proposals that were not selected in the solution. |
 | `Active` | `Executing` | Driver `SettlementStarted`: our solution won and the transaction is being submitted. |
 | `Executing` | `Settled` | Driver `Success`. Transaction hash recorded. |
 | `Executing` | `SettleFailed` | Driver `Revert`. Transaction hash recorded; the Track A debit follows. |
@@ -525,9 +517,11 @@ Every transition:
 
 **Competitive losses are terminal states.** When BYOS picks a winning sub-solver for an order at `/solve` time, all active proposals for that order from *other* sub-solvers are immediately marked `Rejected: SubsolverOutbid`. Proposals from the same sub-solver as the winner are left untouched — BYOS may fall back to a same-solver runner-up within one auction cycle if the best proposal's fee cut breaches the signed limit. When the winning BYOS solution loses the on-chain auction to an external solver, the subsequent simulation revert with reason `"GPv2: order filled"` is translated to `Rejected: SolverOutbid`. Both transitions are recorded in the audit log and exposed through the standard `GET /proposal/{id}` response so sub-solvers can distinguish competitive losses from genuine route failures.
 
-**Replacement is an activation-time, atomic group transition.** A successfully validated proposal becomes `Active` only if it is still the newest eligible submission for its `(subSolver, orderUid)` group. In that same serialized transaction, it changes every older `Submitted` or `Active` proposal in the group to `Cancelled`; `Executing` proposals are unchanged. This ordering prevents an older validator job from replacing or reactivating a newer proposal.
+**Replacement is an activation-time, atomic group transition.** A successfully validated proposal becomes `Active` only if it is still the newest eligible submission for its `(subSolver, orderUid)` group. In that same serialized transaction, it changes every older `Submitted` or `Active` proposal in the group to `Cancelled`; `Executing` proposals are unchanged. This ordering prevents a late incoming POST from reactivating a stale proposal.
 
-`Executing` is entered on `SettlementStarted`, not at `/solve` time, because at `/solve` time we do not yet know we won. It is exempt from the expiry sweep on purpose — the chain enforces the order's real deadline. An abandoned execution returns to `Active`, covering lost notifications and restarts mid-settlement. Success and revert remain terminal. Re-simulation is the truth-teller.
+`Executing` is entered on `SettlementStarted`, not at `/solve` time, because at `/solve` time we do not yet know we won. It is exempt from the expiry sweep on purpose — the chain enforces the order's real deadline. An abandoned execution returns to `Active`, covering lost notifications and restarts mid-settlement. Success and revert remain terminal.
+
+**Selected proposals survive auction closure.** When `/solve` returns, the auction window closes and all unselected `Submitted` or `Active` proposals for that auction are cancelled with reason `AuctionClosed`. Proposals that were included in the solution are explicitly excluded from this sweep — they remain `Active` so that the driver's subsequent settlement notifications (`SettlementStarted`, `Success`, `Revert`) can still advance them through the settlement states.
 
 Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a cancellation, replacement, or notification won the race.
 
@@ -548,20 +542,21 @@ Every reason a proposal stops competing, grouped by when it happens:
 | Rate limited | IP or signer rate limit exceeded |
 | Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Applies to proposal submission only, so a sub-solver whose withdrawal is pending can still read and cancel what it has live. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
 
-**At validation (asynchronous, recorded on the proposal)**
+**At validation (synchronous, on the POST request path)**
 
 | Reason | Meaning |
 |---|---|
 | Insufficient escrow | Balance below the threshold (`gas estimate × gas price + minimum collateral`) |
-| Order not found | Order UID not in CoW's orderbook (filled, expired, or cancelled) |
+| Order not found | Order UID not in the current auction |
 | Unsupported order | Non-ERC20 balance flavors, bridging orders, or (in v1) partially fillable orders |
 | Amount mismatch | Proposal amounts don't match the order (fill-or-kill mismatch, or partial fill violates limits) |
 | Proposed slippage outrange | Gap between `minBuyAmount` and `quoteBuyAmount` exceeds the configured bps or native-token cap (sell orders only) |
-| Unprofitable | Score (`surplus - gas`) is zero or negative on first simulation |
+| Unprofitable | Score (`surplus - gas`) is zero or negative on simulation |
 | Simulation failed | The full settlement simulation reverted — terminal on first occurrence, no retries |
 | Simulation missing Executed event | Simulation succeeded but the Trampoline did not emit an `Executed` event — terminal |
 | `SubsolverOutbid` | BYOS selected a different sub-solver's proposal for this order at `/solve` time |
 | `SolverOutbid` | The BYOS solution was sent to the driver but an external solver won the on-chain auction (`"GPv2: order filled"` revert) |
+| `AuctionClosed` | The auction window closed before this proposal was selected; submitted as `Cancelled` |
 
 **By lifecycle (not a rejection, but the proposal stops competing)**
 
@@ -643,13 +638,13 @@ Before simulating, the order and proposal pair must pass a cheap envelope check 
 
 All four signature schemes are supported, since the scheme is encoded in the trade flags and GPv2 verifies it for real during simulation. Sell and buy orders are both supported, including native-ETH buys. Order hooks are included in the simulation for accurate gas, using the order's pre-encoded interactions from the orderbook; the `/solve` response does not include hooks, because the driver appends the order's own hooks itself.
 
-**A revert is terminal on the first occurrence.** No strikes, no retry. A proposal that reverted once is not offered to `/solve` — if it won and then reverted on-chain, the sub-solver takes a Track A penalty. Transport errors are different: an RPC timeout or DNS failure defers to the next tick rather than punishing the sub-solver, and orderbook 404s reject while transient orderbook errors defer.
+**A revert is terminal on the first occurrence.** No strikes, no retry. A proposal that reverted once is not offered to `/solve` — if it won and then reverted on-chain, the sub-solver takes a Track A penalty.
 
-**The profitability gate runs on the first simulation only.** A score of zero or less rejects as unprofitable, matching `/solve`'s own inclusion rule, so one invariant holds: an `Active` proposal is one that could win an auction right now. It is not re-applied on re-validation, because gas prices wobble and rejecting on a spike would churn proposals that are profitable again two blocks later.
+**The profitability gate runs on the single simulation only.** A score of zero or less rejects as unprofitable, matching `/solve`'s own inclusion rule, so one invariant holds: an `Active` proposal is one that could win an auction right now.
 
-**Proposal lifetime is capped at ingestion.** `validUntil` more than the configured maximum in the future is rejected, which bounds worst-case simulation cost per proposal and guarantees the expiry sweep arrives. Sub-solvers already run polling loops, and a route priced longer ago than that is stale anyway. The order's own `validTo` needs no separate handling: once the order expires or fills, simulation reverts and first-revert-terminal cleans up within a tick.
+**Proposal lifetime is capped at ingestion.** `validUntil` more than the configured maximum in the future is rejected, which bounds worst-case simulation cost per proposal and guarantees the expiry sweep arrives. Sub-solvers already run polling loops, and a route priced longer ago than that is stale anyway. The order's own `validTo` needs no separate handling: once the order expires or fills, simulation reverts and first-revert-terminal rejects at submission.
 
-Re-simulation runs every tick for `Submitted` and `Active` proposals, at an interval targeting about one block. `Executing` proposals are not simulated. This is deliberately not every-block simulation of everything; the driver's own post-encoding re-simulation catches proposals that go stale in between.
+There is no background re-simulation. Each proposal is simulated once, at submission time. The driver's own post-encoding re-simulation catches proposals that go stale in between. `Executing` proposals are never simulated.
 
 ### Slippage protection
 

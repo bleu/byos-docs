@@ -24,24 +24,27 @@ flowchart LR
     SS[Sub-solver] -->|POST /proposals| PR[Parse + verify signature]
     PR --> EX[Expiry window check]
     EX --> DB[(Store as Submitted)]
-    DB --> R[202 Accepted + id]
+    DB -->|active auction| V[Escrow + simulation\nvalidation]
+    V -->|pass| ACT[(Transition to Active)]
+    ACT --> R200[200 active + id]
+    V -->|fail| R400[400 rejected + reason]
+    DB -->|no active auction| R202[202 + id]
 ```
 
-The request path does three things inline: parse, verify the proposal signature, and expiry-window check. On success, the proposal is stored as `Submitted` and answered `202` — meaning "accepted for validation", not "accepted".
+The request path parses the proposal, verifies the signature, checks the expiry window, and runs escrow and simulation validation synchronously. A `200` response means the proposal is active in the current auction. A `400 noActiveAuction` response means no auction is running (proposal not stored). A `400 ProposalRejected` response means validation failed with a typed reason. A `202` response means the proposal was stored but the auction closed between the initial check and validation — resubmit when the next auction opens.
 
 For EOA sub-solvers the signature verification is a pure `ecrecover` — no RPC, no state. For contract sub-solvers (`subSolverAddress` present in the POST body) the service tries `ecrecover` first; if that does not match the declared address it falls back to one `eth_call` invoking `isValidSignature` on the contract. See [`#proposal-schema`](#proposal-schema).
-
-**All on-chain work is deferred.** The escrow balance check and settlement simulation run in a background validator loop, not on the request path. This decouples response latency from blockchain health and prevents DDoS on the public port from starving `/solve`.
 
 ### Solving (internal)
 
 ```mermaid
 flowchart LR
     D[CoW Driver] -->|POST /solve<br/>auction + gas price| E[Solver engine]
-    E --> F[Fetch active proposals<br/>by order UIDs]
-    F --> S[Score: surplus - gas<br/>per proposal]
+    E --> P[Prefetch escrow balances\nmulticall, all known sub-solvers]
+    P --> F[Fetch active proposals\nby order UIDs]
+    F --> S[Score: surplus - gas\nper proposal]
     S --> W[Pick highest per order]
-    W --> C[Build settlement<br/>interactions]
+    W --> C[Build settlement\ninteractions]
     C --> R[Return solutions]
 ```
 
@@ -64,19 +67,11 @@ The CoW driver notifies BYOS of outcomes via `POST /notify`. There is no chain w
 
 Three background loops run alongside the HTTP listeners:
 
-### Validation loop
+### Stale-executing sweep
 
-Runs every ~12 seconds (one block):
+Runs every ~5 minutes. Transitions proposals stuck in `Executing` for more than `EXECUTING_TIMEOUT_SECS` (default 5 minutes) back to `Active`. Handles lost notifications and service restarts.
 
-1. **Release stale executing proposals** — proposals stuck in `Executing` for more than 5 minutes (lost notification or restart) fall back to `Active`.
-2. **Expire proposals** — any `Submitted` or `Active` proposal with `validUntil < now` transitions to `Expired`.
-3. **Validate remaining proposals** — for each `Submitted` or `Active` proposal:
-   - **Escrow floor** (cheap): require `effectiveBalance(subSolver) >= MIN_COLLATERAL`. After simulation, check cumulative active/executing exposure using fresh simulated gas, the deployment penalty cap, and positive outstanding buffer debt. Exclude submitted siblings and replaced older active routes. Admission is concurrent and may temporarily overcommit collateral; see [collateral gates](design-document#collateral-gates-and-deployment-penalty-cap).
-   - **Order envelope check** (no RPC): ERC20 balances only, no bridging orders, amounts consistent with order kind. For sell orders: `order.buyAmount <= minBuyAmount <= quoteBuyAmount`, `quoteBuyAmount` beats the limit price. For buy orders: `minBuyAmount == quoteBuyAmount == order.buyAmount` (hard-reject otherwise). Partially fillable orders use the same constraints against scaled amounts.
-   - **Settlement simulation** (expensive): full `settle()` via `eth_estimateGas` with state overrides. Records gas used, trampoline address, and token addresses on success.
-   - **Profitability gate** (first validation only): `score = surplus - gas > 0`. Not re-applied on re-validation to avoid gas-price flapping churn.
-
-A simulation revert is **terminal on first occurrence** — no strikes, no retries.
+Validation does not run in a background loop. Escrow and simulation checks run synchronously on the `POST /proposals` request path. See [Proposal ingestion](#proposal-ingestion-public).
 
 ### Penalty loop
 
@@ -102,12 +97,9 @@ stateDiagram-v2
     Submitted --> Active: simulation passes,\nscore > 0
     Submitted --> Rejected: gatekeeping fails
     Submitted --> SimFailed: simulation reverts
-    Active --> Active: re-simulation each tick
-    Active --> SimFailed: re-simulation reverts
-    Active --> Rejected: escrow re-check fails
     Active --> Executing: driver SettlementStarted
-    Submitted --> Cancelled: newer proposal activates
-    Active --> Cancelled: newer proposal activates
+    Submitted --> Cancelled: newer proposal activates\nor AuctionClosed
+    Active --> Cancelled: newer proposal activates\nor AuctionClosed
     Submitted --> Expired: validUntil passed
     Active --> Expired: validUntil passed
     Submitted --> Cancelled: DELETE
@@ -124,8 +116,8 @@ A state answers one question: **what does the service do with this proposal righ
 
 | State | Simulated? | Offered to `/solve`? | Cancellable? |
 |---|---|---|---|
-| `Submitted` | First pass pending | No | Yes |
-| `Active` | Every tick | Yes | Yes |
+| `Submitted` | Inline on POST | No | Yes |
+| `Active` | No | Yes | Yes |
 | `Executing` | No | No | No |
 | `Rejected` / `SimFailed` / `Expired` / `Cancelled` | No | No | No |
 | `Settled` / `SettleFailed` / `Penalized` | No | No | No |
@@ -179,11 +171,9 @@ The cut is **not padded** — a larger cut lowers the score, which lowers CIP-85
 
 Rationale for each decision lives in the ADRs of [byos-service](https://github.com/bleu/byos-service/tree/main/docs/adr) and [byos-service-ts](https://github.com/bleu/byos-service-ts/tree/main/docs/adr). This section summarizes the final state.
 
-### Async ingestion
+### Sync ingestion
 
-The request path does only signature + expiry checks. Escrow and simulation validation run in the background.
-
-A `2xx` from `POST /proposals` means "accepted for validation", not "accepted".
+The request path validates proposals synchronously (escrow + simulation). A `200` means active; `400 noActiveAuction` means no auction is running and the proposal is not stored; `400 ProposalRejected` means validation failed with a typed reason. `202` is a rare race-condition case: the proposal was stored but the auction closed before validation completed.
 
 ### No chain watcher
 
