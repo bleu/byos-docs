@@ -475,9 +475,8 @@ stateDiagram-v2
     Submitted --> Lost: outcome worker\n(no driver outcome in window)
     Lost --> Settled: late driver Success
     Lost --> SettleFailed: late driver Revert
-    SettleFailed --> Penalized: Track A escrow debit lands
     Settled --> [*]
-    Penalized --> [*]
+    SettleFailed --> [*]
     Lost --> [*]
 ```
 
@@ -489,12 +488,10 @@ A state answers exactly one question: what does the service do with this proposa
 | `Submitted` | DB (proposals) | no — already sent | no | until terminal |
 | `Rejected` | DB (proposals_log) | no | no | permanent log |
 | `SimFailed` | DB (proposals_log) | no | no | permanent log |
-| `Expired` | DB (proposals_log) | no | no | permanent log |
 | `Cancelled` | DB (proposals_log) | no | no | permanent log |
 | `Lost` | DB (proposals_log) | no | no | permanent log |
 | `Settled` | DB (proposals → proposals_log on delete) | no | no | permanent log |
 | `SettleFailed` | DB (proposals_log) | no | no | permanent log |
-| `Penalized` | DB (proposals_log) | no | no | permanent log |
 
 Every transition:
 
@@ -510,7 +507,6 @@ Every transition:
 | `Submitted` | `Lost` | Outcome worker: no driver outcome observed within the window. Reason is `SolverOutbid` (on-chain Trade event found for the order) or `UnknownOutput` (no trade found). Row deleted. |
 | `Lost` | `Settled` | Late driver `Success` after outcome worker acted. Updates `proposals_log` directly. |
 | `Lost` | `SettleFailed` | Late driver `Revert` after outcome worker acted. Updates `proposals_log` directly. |
-| `SettleFailed` | `Penalized` | Track A escrow debit lands on-chain. Penalty transaction hash recorded in `proposals_log`. |
 
 **Candidates are not persisted until selected.** A candidate ID is allocated from the Postgres `proposals_id_seq` without inserting a row. The ID is returned to the sub-solver immediately. If byos restarts before the auction, the candidate is lost — the sub-solver can resubmit, and the same auction will likely still be running.
 
@@ -598,7 +594,7 @@ A background job runs every `OUTCOME_WORKER_INTERVAL_SECS` (default 60s). It fin
 - Trade event found → `Lost/SolverOutbid`
 - No trade event → `Lost/UnknownOutput`
 
-The worker marks the row `lost`, inserts a penalty entry, and deletes the live row. A subsequent driver notification takes precedence over this provisional outcome.
+The worker marks the row `lost` and deletes the live row. A subsequent driver notification takes precedence over this provisional outcome.
 
 **Attribution:** The driver and outcome worker both use `proposal.id` directly as the `solutionId` in `/solve` responses. There is no `solutions` join table. `/notify` looks up proposals by ID in `proposals` first, then in `proposals_log` (for rows already deleted by the outcome worker or a previous notification).
 
