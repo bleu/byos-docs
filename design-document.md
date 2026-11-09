@@ -400,7 +400,7 @@ The public HTTP surface by which sub-solvers submit signed proposals. Field-leve
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /proposals` | Submit a signed proposal. Answers `202 Accepted` with an id. |
+| `POST /proposals` | Submit a signed proposal. Answers `200 OK` with an id after validation; the proposal is an in-memory `candidate`. |
 | `GET /proposal/{id}` | The caller's full proposal: all amounts, tokens, interactions, simulation results, and timestamps. Falls back to the permanent log for swept proposals. |
 | `GET /proposals/{order_uid}` | The caller's proposals on that order. Accepts `?includeArchived=true` to include swept proposals. |
 | `GET /proposals/by-sub-solver` | All of the caller's proposals. Accepts `?includeArchived=true` to include full history. |
@@ -431,11 +431,11 @@ struct CancelProposal {
 }
 ```
 
-Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Once the newer proposal validates, it cancels the caller's older `Submitted` and `Active` proposals for the same order.
+Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Candidates compete within the current auction; a new submission does not replace older candidates. Only selected candidates become `submitted`.
 
-**Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `202 Accepted` and creates no row, audit event, or replacement. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, so there is no unsigned replacement-intent field.
+**Nonces protect on-chain execution.** The TypeScript service does not use `(subSolver, nonce)` as an HTTP idempotency key. A repeated signed submission is validated independently and can receive a new proposal id. Do not rely on a retry returning the original id or on an off-chain `409 NonceAlreadyUsed` check; the Trampoline enforces nonce consumption when executing the signed proposal.
 
-**Ingestion is synchronous.** The request path validates proposals inline: parse, verify the signature, check the expiry window, then run the escrow check and settlement simulation. For EOA sub-solvers, signature verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. A `200` response means the proposal passed all checks and is `Active` in the current auction. A `400 ProposalRejected` means it failed; the `reason` field carries the typed rejection reason. A `202` means the proposal was stored as `Submitted` but no active auction is running — the sub-solver should resubmit when the next auction opens.
+**Ingestion is synchronous.** The request path validates proposals inline: parse, verify the signature, check the expiry window, then run the escrow check and settlement simulation. For EOA sub-solvers, signature verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. A `200` response with `{"id": n}` means the proposal passed all checks and is an in-memory `candidate` in the current auction. A `400 ProposalRejected` means validation failed; the error `description` carries the typed rejection reason. With no active auction, the service returns `400 NoActiveAuction` before allocating an id or storing a proposal. If validation cannot complete after an id is allocated (including auction closure), the service records a rejected `AuctionClosed` log entry and still returns `400 NoActiveAuction`. Neither case returns `202`; retry when an auction is available.
 
 **Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and a signer known to be below the minimum escrow is rejected once a balance is known. That rejection applies to submission only: effective escrow balance reads as zero from the moment a sub-solver requests a withdrawal, so gating reads and cancellations too would leave a sub-solver winding down unable to cancel, or even see, the proposals it still has live. An address the service has not seen before is admitted at the lowest tier rather than rejected, since absence of a cached balance is not evidence of an empty one. The escrow balance behind the second layer is cached so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
 
@@ -481,7 +481,7 @@ stateDiagram-v2
     Lost --> SettleFailed: late revert or cancelled
     SettleFailed --> Settled: DriverCancelled corrected by confirmed success
     SettleFailed --> SettleFailed: DriverCancelled corrected by confirmed revert
-    SettleFailed --> Penalized: revert debit lands
+    SettleFailed --> SettleFailed: revert debit lands; record penaltyTxHash
 ```
 
 All states except `candidate` and `submitted` are terminal for bidding. Owner reads
@@ -500,7 +500,9 @@ it cannot overwrite a confirmed contradictory chain outcome.
 | `submitted` | `lost` | Outcome observation window elapsed; `SolverOutbid` if an external fill is observed, otherwise `UnknownOutput`. |
 | `lost` | `settled` | Late driver `success` with a transaction hash; clear the loss reason. |
 | `settleFailed` / `DriverCancelled` | `settled` or `settleFailed` / `SettlementReverted` | Late confirmed success or revert; preserve any existing penalty hash and financial reconciliation. |
-| `settleFailed` / `SettlementReverted` | `penalized` | The revert escrow debit lands; record its hash. |
+| `settleFailed` / `SettlementReverted` | `settleFailed` / `SettlementReverted` | The revert escrow debit lands; record `penaltyTxHash` without changing the outcome status. |
+
+`penalized` is a legacy response status. Current debit writers preserve the settlement outcome status and record the escrow debit in `penaltyTxHash`.
 
 **Status is not financial evidence.** `DriverCancelled` does not prove a
 cancellation transaction was broadcast or mined. The driver supplies no
@@ -538,7 +540,6 @@ Every reason a proposal stops competing, grouped by when it happens:
 | Invalid signature | Malformed signature hex or recovery failure |
 | Proposal expired | `validUntil` is already in the past |
 | Lifetime exceeded | `validUntil` is more than 5 minutes in the future (configurable) |
-| Nonce already used | This sub-solver used the nonce for different signed content; an exact signed replay is idempotent and returns its original id with `202`. |
 | Rate limited | IP or signer rate limit exceeded |
 | Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Applies to proposal submission only, so a sub-solver whose withdrawal is pending can still read and cancel what it has live. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
 
@@ -641,7 +642,7 @@ All four signature schemes are supported, since the scheme is encoded in the tra
 
 **A revert is terminal on the first occurrence.** No strikes, no retry. A proposal that reverted once is not offered to `/solve` — if it won and then reverted on-chain, the sub-solver takes a Track A penalty.
 
-**The profitability gate runs on the single simulation only.** A score of zero or less rejects as unprofitable, matching `/solve`'s own inclusion rule, so one invariant holds: an `Active` proposal is one that could win an auction right now.
+**The profitability gate runs on the single simulation only.** A score of zero or less rejects as unprofitable, matching `/solve`'s own inclusion rule, so one invariant holds: a `candidate` passed the profitability gate at validation time.
 
 **Proposal lifetime is capped at ingestion.** `validUntil` more than the configured maximum in the future is rejected, which bounds worst-case simulation cost per proposal and guarantees the expiry sweep arrives. Sub-solvers already run polling loops, and a route priced longer ago than that is stale anyway. The order's own `validTo` needs no separate handling: once the order expires or fills, simulation reverts and first-revert-terminal rejects at submission.
 

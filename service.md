@@ -23,15 +23,15 @@ They never share a socket. A `/solve` response contains the full standing propos
 flowchart LR
     SS[Sub-solver] -->|POST /proposals| PR[Parse + verify signature]
     PR --> EX[Expiry window check]
-    EX --> DB[(Store as Submitted)]
-    DB -->|active auction| V[Escrow + simulation\nvalidation]
-    V -->|pass| ACT[(Transition to Active)]
-    ACT --> R200[200 active + id]
+    EX --> A{Active auction?}
+    A -->|yes| V[Escrow + simulation\nvalidation]
+    V -->|pass| C[Hold candidate in memory]
+    C --> R200[200 + id]
     V -->|fail| R400[400 rejected + reason]
-    DB -->|no active auction| R202[202 + id]
+    A -->|no| RNO[400 NoActiveAuction]
 ```
 
-The request path parses the proposal, verifies the signature, checks the expiry window, and runs escrow and simulation validation synchronously. A `200` response means the proposal is active in the current auction. A `400 noActiveAuction` response means no auction is running (proposal not stored). A `400 ProposalRejected` response means validation failed with a typed reason. A `202` response means the proposal was stored but the auction closed between the initial check and validation — resubmit when the next auction opens.
+The request path parses the proposal, verifies the signature, checks the expiry window, and runs escrow and simulation validation synchronously. A `200` response with `{"id": n}` means the proposal is an in-memory `candidate`. A `400 NoActiveAuction` response before validation means no auction is running and no proposal was stored. If validation cannot complete after an id was allocated, a rejected `AuctionClosed` entry is retained in `proposals_log` and the response is still `400 NoActiveAuction`. A `400 ProposalRejected` response means validation failed with a typed reason in `description`. There is no `202` success or deferred-validation response.
 
 For EOA sub-solvers the signature verification is a pure `ecrecover` — no RPC, no state. For contract sub-solvers (`subSolverAddress` present in the POST body) the service tries `ecrecover` first; if that does not match the declared address it falls back to one `eth_call` invoking `isValidSignature` on the contract. See [`#proposal-schema`](#proposal-schema).
 
@@ -92,7 +92,7 @@ Runs on the same interval as validation. Processes Track A debits and post-settl
 1. For each `settleFailed` / `SettlementReverted` proposal (including legacy null reasons with a settlement hash): fetch settlement tx receipt, compute `gas_used × effective_gas_price + frozen c_l`, call `escrow.debit(subSolver, amount, txHash)`.
 2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × frozen c_l, orderUidHash)`.
 3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `solutions` table), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `c_l`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
-4. On success: transition to `Penalized` (for Track A), record the debit tx hash.
+4. On debit success: record `penaltyTxHash` while preserving the settlement outcome status. `penalized` is a legacy response status.
 5. Retry up to 10 times on transient failures, then park for operator investigation.
 
 ### Retention sweep
@@ -115,9 +115,9 @@ hashes and reconciliation of signed or landed abandonment operations. Confirmed
 contradictory outcomes cannot be overwritten. Historical rows stay unchanged;
 this correction creates no historical debit or refund.
 
-`POST /proposals` uses `(subSolver, nonce)` as its idempotency key. An identical
-signed replay returns the original id with `202` and has no side effects;
-different signed content for the same key returns `409 NonceAlreadyUsed`.
+The TypeScript service validates repeated signed submissions independently; it
+does not deduplicate HTTP requests by `(subSolver, nonce)`. A retry can receive a
+new id. On-chain nonce consumption remains the Trampoline's replay protection.
 
 ## Persistence
 
@@ -165,7 +165,7 @@ Rationale for each decision lives in the ADRs of [byos-service](https://github.c
 
 ### Sync ingestion
 
-The request path validates proposals synchronously (escrow + simulation). A `200` means active; `400 noActiveAuction` means no auction is running and the proposal is not stored; `400 ProposalRejected` means validation failed with a typed reason. `202` is a rare race-condition case: the proposal was stored but the auction closed before validation completed.
+The request path validates proposals synchronously (escrow + simulation). A `200` means an in-memory `candidate`; `400 NoActiveAuction` means the auction is unavailable, including when validation cannot complete after id allocation. In the latter case a rejected `AuctionClosed` log entry is retained. `400 ProposalRejected` means validation failed with a typed reason in `description`. No path returns `202`.
 
 ### No chain watcher
 
