@@ -56,10 +56,19 @@ The CoW driver notifies BYOS of outcomes via `POST /notify`. There is no chain w
 
 | Notification | Proposal transition |
 |---|---|
-| `SettlementStarted` | `Active` → `Executing` |
-| `Success { transaction }` | `Active` or `Executing` → `Settled` |
-| `Revert { transaction }` | `Active` or `Executing` → `SettleFailed` (triggers Track A debit) |
-| `Cancelled` / `Expired` / `Fail` | `Executing` → `Active` (queues non-settlement debit) |
+| `settlementStarted` | `submitted` unchanged; retain start evidence. |
+| `success { transaction }` | `submitted`, `lost`, or `DriverCancelled` → `settled`. |
+| `revert { transaction }` | `submitted`, `lost`, or `DriverCancelled` → `settleFailed` / `SettlementReverted`. |
+| `cancelled` | `submitted` or `lost` → `settleFailed` / `DriverCancelled`; no settlement hash implied. |
+| `expired` / `fail` | `submitted` → `lost`; financial eligibility remains evidence-based. |
+
+`DriverCancelled` alone never authorizes an escrow debit. Matching auction/solution
+start and abandonment evidence is required for the existing 10% of snapshotted
+`c_l` charge. Timeout and competitive loss alone do not authorize a penalty.
+Revert debits require `SettlementReverted` (or a legacy null reason), a settlement
+hash, and no conflicting abandonment operation requiring reconciliation. Preserve
+existing penalty hashes on corrections; never substitute a debit hash for a
+settlement/cancellation hash.
 
 `/notify` joins to proposals through the `(auction_id, solution_id, proposal_id)` mapping that `/solve` records synchronously before returning solutions.
 
@@ -67,9 +76,12 @@ The CoW driver notifies BYOS of outcomes via `POST /notify`. There is no chain w
 
 Three background loops run alongside the HTTP listeners:
 
-### Stale-executing sweep
+### Outcome observation
 
-Runs every ~5 minutes. Transitions proposals stuck in `Executing` for more than `EXECUTING_TIMEOUT_SECS` (default 5 minutes) back to `Active`. Handles lost notifications and service restarts.
+Submitted proposals with no observed outcome become `lost`. This is observational
+and never authorizes a penalty. Durable notification evidence survives removal of
+the live row, allowing late cancellations and confirmed chain outcomes to correct
+`proposals_log`.
 
 Validation does not run in a background loop. Escrow and simulation checks run synchronously on the `POST /proposals` request path. See [Proposal ingestion](#proposal-ingestion-public).
 
@@ -77,7 +89,7 @@ Validation does not run in a background loop. Escrow and simulation checks run s
 
 Runs on the same interval as validation. Processes Track A debits and post-settlement buffer accounting:
 
-1. For each `SettleFailed` proposal: fetch settlement tx receipt, compute `gas_used × effective_gas_price + frozen c_l`, call `escrow.debit(subSolver, amount, txHash)`.
+1. For each `settleFailed` / `SettlementReverted` proposal (including legacy null reasons with a settlement hash): fetch settlement tx receipt, compute `gas_used × effective_gas_price + frozen c_l`, call `escrow.debit(subSolver, amount, txHash)`.
 2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × frozen c_l, orderUidHash)`.
 3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `solutions` table), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `c_l`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
 4. On success: transition to `Penalized` (for Track A), record the debit tx hash.
@@ -91,42 +103,21 @@ Swept proposals are not lost: every proposal is mirrored to a permanent `proposa
 
 ## Proposal lifecycle
 
-```mermaid
-stateDiagram-v2
-    [*] --> Submitted: POST /proposals
-    Submitted --> Active: simulation passes,\nscore > 0
-    Submitted --> Rejected: gatekeeping fails
-    Submitted --> SimFailed: simulation reverts
-    Active --> Executing: driver SettlementStarted
-    Submitted --> Cancelled: newer proposal activates\nor AuctionClosed
-    Active --> Cancelled: newer proposal activates\nor AuctionClosed
-    Submitted --> Expired: validUntil passed
-    Active --> Expired: validUntil passed
-    Submitted --> Cancelled: DELETE
-    Active --> Cancelled: DELETE
-    Active --> Settled: driver Success\n(missed Started)
-    Active --> SettleFailed: driver Revert\n(missed Started)
-    Executing --> Settled: driver Success
-    Executing --> SettleFailed: driver Revert
-    Executing --> Active: driver Cancelled/Fail,\nor timeout
-    SettleFailed --> Penalized: Track A debit lands
-```
+The settlement state machine and correction rules are defined in the
+[design document](design-document.md#proposal-lifecycle). A validated proposal
+waits in memory as `candidate`; `/solve` persists the selected proposal as
+`submitted`. Start notifications retain evidence without changing that status.
+Known cancellations and mined reverts both use `settleFailed`, distinguished by
+`DriverCancelled` and `SettlementReverted`. Ordinary losses remain `lost`.
 
-A state answers one question: **what does the service do with this proposal right now?**
+A confirmed late success/revert may correct a cancellation, preserving penalty
+hashes and reconciliation of signed or landed abandonment operations. Confirmed
+contradictory outcomes cannot be overwritten. Historical rows stay unchanged;
+this correction creates no historical debit or refund.
 
-| State | Simulated? | Offered to `/solve`? | Cancellable? |
-|---|---|---|---|
-| `Submitted` | Inline on POST | No | Yes |
-| `Active` | No | Yes | Yes |
-| `Executing` | No | No | No |
-| `Rejected` / `SimFailed` / `Expired` / `Cancelled` | No | No | No |
-| `Settled` / `SettleFailed` / `Penalized` | No | No | No |
-
-`POST /proposals` uses `(subSolver, nonce)` as its idempotency key. An identical signed replay returns the original id with `202` and has no side effects; different signed content for the same key returns `409 NonceAlreadyUsed`.
-
-When a proposal is still the newest eligible submission and validates, one serialized group transaction activates it and cancels older `Submitted` or `Active` proposals for the same `(subSolver, orderUid)`. It never cancels `Executing` proposals and prevents a late older validator from reactivating stale work.
-
-Transitions are **compare-and-swap** — zero rows affected means the caller's verdict was stale (a cancellation, replacement, or notification won the race).
+`POST /proposals` uses `(subSolver, nonce)` as its idempotency key. An identical
+signed replay returns the original id with `202` and has no side effects;
+different signed content for the same key returns `409 NonceAlreadyUsed`.
 
 ## Persistence
 
@@ -138,7 +129,8 @@ Postgres is the source of truth:
 | `audit_events` | Append-only history — what happened, when, why | No deletion path. Dispute evidence for Track B claims arriving up to 3 months later. |
 | `solutions` | Attribution mapping `(auction_id, solution_id) → proposal_id`. Also stores the buy token's reference price from the auction for post-settlement buffer accounting. | Indefinite |
 | `buffer_entries` | Signed ledger of per-proposal buffer amounts for proposals using loose slippage (`minBuyAmount < quoteBuyAmount`). Each entry records the buy token, the gap between `quoteBuyAmount` and the delivered `delta`, converted to native token. Entries accumulate until the balance exceeds `c_l`, then are cleared in batch. Indexed by `(sub_solver, cleared)` and `proposal_id`. | Indefinite |
-| `penalties` | Pending non-settlement debits (queued by `Cancelled`/`Expired`/`Fail` notifications) | Processed by the penalty loop, then retained |
+| `settlement_attempts`, `settlement_attempt_members`, `settlement_notifications` | Attributed attempts and durable start/abandonment/chain-outcome evidence; eligibility is independent of proposal status | Retained for financial recovery and reconciliation |
+| `debit_operations` | Unique source identities, leases, retries, and signed bytes for escrow debits | Retained for idempotent recovery |
 
 The audit trail uses a write-behind pattern: events are emitted after their proposal write commits, persisted by a dedicated background worker. This decouples audit codec evolution from the store's hot path. The crash window (state change committed, audit event not yet persisted) is accepted at one event per crash.
 
