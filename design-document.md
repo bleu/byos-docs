@@ -22,7 +22,7 @@ These anchors are the interface between this document and every ADR that cites i
 | [`#proposal-api`](#proposal-api) | HTTP surface, authentication, rate limiting |
 | [`#proposal-lifecycle`](#proposal-lifecycle) | State machine, simulation, retention |
 | [`#solver-engine`](#solver-engine) | Selection, scoring, settlement crafting |
-| [`#single-order-solutions`](#single-order-solutions) | One order per proposal, per settlement |
+| [`#single-order-solutions`](#single-order-solutions) | One order per proposal; same-sub-solver settlement batches |
 | [`#gas`](#gas) | The gas cut and how CoW fees actually work |
 | [`#penalties`](#penalties) | The penalty schedule as a whole |
 | [`#track-a`](#track-a) | Revert, deadline, and non-settlement debits |
@@ -400,7 +400,7 @@ The public HTTP surface by which sub-solvers submit signed proposals. Field-leve
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /proposals` | Submit a signed proposal. Answers `202 Accepted` with an id. |
+| `POST /proposals` | Submit a signed proposal. Answers `200 OK` with an id after validation; the proposal is an in-memory `candidate`. |
 | `GET /proposal/{id}` | The caller's full proposal: all amounts, tokens, interactions, simulation results, and timestamps. Falls back to the permanent log for swept proposals. |
 | `GET /proposals/{order_uid}` | The caller's proposals on that order. Accepts `?includeArchived=true` to include swept proposals. |
 | `GET /proposals/by-sub-solver` | All of the caller's proposals. Accepts `?includeArchived=true` to include full history. |
@@ -431,11 +431,11 @@ struct CancelProposal {
 }
 ```
 
-Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Once the newer proposal validates, it cancels the caller's older `Submitted` and `Active` proposals for the same order.
+Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Candidates compete within the current auction; a new submission does not replace older candidates. Only selected candidates become `submitted`.
 
-**Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `202 Accepted` and creates no row, audit event, or replacement. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, so there is no unsigned replacement-intent field.
+**Nonces protect on-chain execution.** The TypeScript service does not use `(subSolver, nonce)` as an HTTP idempotency key. A repeated signed submission is validated independently and can receive a new proposal id. Do not rely on a retry returning the original id or on an off-chain `409 NonceAlreadyUsed` check; the Trampoline enforces nonce consumption when executing the signed proposal.
 
-**Ingestion is synchronous.** The request path validates proposals inline: parse, verify the signature, check the expiry window, then run the escrow check and settlement simulation. For EOA sub-solvers, signature verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. A `200` response means the proposal passed all checks and is `Active` in the current auction. A `400 ProposalRejected` means it failed; the `reason` field carries the typed rejection reason. A `202` means the proposal was stored as `Submitted` but no active auction is running — the sub-solver should resubmit when the next auction opens.
+**Ingestion is synchronous.** The request path validates proposals inline: parse, verify the signature, check the expiry window, then run the escrow check and settlement simulation. For EOA sub-solvers, signature verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. A `200` response with `{"id": n}` means the proposal passed all checks and is an in-memory `candidate` in the current auction. A `400 ProposalRejected` means validation failed; the error `description` carries the typed rejection reason. With no active auction, the service returns `400 NoActiveAuction` before allocating an id or storing a proposal. If validation cannot complete after an id is allocated (including auction closure), the service records a rejected `AuctionClosed` log entry and still returns `400 NoActiveAuction`. Neither case returns `202`; retry when an auction is available.
 
 **Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and a signer known to be below the minimum escrow is rejected once a balance is known. That rejection applies to submission only: effective escrow balance reads as zero from the moment a sub-solver requests a withdrawal, so gating reads and cancellations too would leave a sub-solver winding down unable to cancel, or even see, the proposals it still has live. An address the service has not seen before is admitted at the lowest tier rather than rejected, since absence of a cached balance is not evidence of an empty one. The escrow balance behind the second layer is cached so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
 
@@ -463,69 +463,71 @@ The write-behind leaves a small crash window: an audit event is emitted only aft
 
 ### States
 
+The current service uses `candidate` for a validated proposal awaiting selection
+in memory and `submitted` for a selected proposal persisted before `/solve`
+returns it. There is no separate `executing` status: `settlementStarted` is
+retained as durable settlement-attempt evidence and leaves `submitted` unchanged.
+
 ```mermaid
 stateDiagram-v2
-    [*] --> Submitted: POST /proposals\n(no active auction)
-    Submitted --> Active: POST /proposals\nsimulation passes, score > 0
-    Submitted --> Rejected: POST /proposals\ngatekeeping fails\n(escrow, envelope, unprofitable, ...)
-    Submitted --> SimFailed: POST /proposals\nsimulation reverts
-    Active --> Executing: driver SettlementStarted
-    Submitted --> Cancelled: newer proposal activates\nor AuctionClosed
-    Active --> Cancelled: newer proposal activates\nor AuctionClosed
-    Submitted --> Expired: validUntil passed
-    Active --> Expired: validUntil passed
-    Submitted --> Cancelled: DELETE /proposals/{id}
-    Active --> Cancelled: DELETE /proposals/{id}
-    Executing --> Settled: driver Success
-    Executing --> SettleFailed: driver Revert
-    Executing --> Active: driver Cancelled/Expired/Fail,\nor executing timeout
-    SettleFailed --> Penalized: Track A escrow debit lands
-    Settled --> [*]
-    Penalized --> [*]
+    [*] --> Candidate: validation passes
+    Candidate --> Submitted: selected by /solve
+    Candidate --> Cancelled: DELETE or auction closes
+    Candidate --> Expired: validUntil passed
+    Submitted --> Settled: driver success with transaction
+    Submitted --> SettleFailed: driver revert or cancelled
+    Submitted --> Lost: expired, fail, or outcome timeout
+    Lost --> Settled: late success with transaction
+    Lost --> SettleFailed: late revert or cancelled
+    SettleFailed --> Settled: DriverCancelled corrected by confirmed success
+    SettleFailed --> SettleFailed: DriverCancelled corrected by confirmed revert
+    SettleFailed --> SettleFailed: revert debit lands; record penaltyTxHash
 ```
 
-A state answers exactly one question: what does the service do with this proposal right now?
+All states except `candidate` and `submitted` are terminal for bidding. Owner reads
+fall back to the permanent `proposals_log` after the live row is removed. A
+late attributable notification can correct an unknown loss or driver cancellation;
+it cannot overwrite a confirmed contradictory chain outcome.
 
-| State | Simulated | Offered to `/solve` | Expiry sweep | Cancellable | Retention |
-|---|---|---|---|---|---|
-| `Submitted` | inline on POST | no | yes | yes | live |
-| `Active` | no | yes | yes | yes | live |
-| `Executing` | no | no | no | no | live |
-| `Rejected` | no | no | — | no | 1 hour |
-| `SimFailed` | no | no | — | no | 1 hour |
-| `Expired` | no | no | — | no | 1 hour |
-| `Cancelled` | no | no | — | no | 1 hour |
-| `Settled` | no | no | — | no | indefinite |
-| `SettleFailed` | no | no | — | no | indefinite |
-| `Penalized` | no | no | — | no | indefinite |
-
-Every transition:
-
-| From | To | Trigger |
+| From | To | Trigger and reason |
 |---|---|---|
-| — | `Submitted` | `POST /proposals` when no active auction is running: signature verified, expiry window OK. |
-| `Submitted` | `Active` | `POST /proposals` during an active auction: escrow check, envelope check, simulation succeeds, score > 0. Writes gas, trampoline address, token addresses. |
-| `Submitted` | `Rejected` | `POST /proposals`: a gatekeeping rule fails — insufficient escrow, unsupported order, amount mismatch, order not found, or unprofitable. Carries the typed reason. Also on `AuctionClosed` when the auction window closes. |
-| `Submitted` | `SimFailed` | `POST /proposals`: simulation reverts. Terminal on first occurrence. |
-| `Submitted`, `Active` | `Expired` | `validUntil` is behind the clock. |
-| `Submitted`, `Active` | `Cancelled` | Signed `DELETE` by the owner, or a newer proposal for the same `(subSolver, orderUid)` validates and activates. `DELETE` against any other state is a 409. Also on `AuctionClosed` for proposals that were not selected in the solution. |
-| `Active` | `Executing` | Driver `SettlementStarted`: our solution won and the transaction is being submitted. |
-| `Executing` | `Settled` | Driver `Success`. Transaction hash recorded. |
-| `Executing` | `SettleFailed` | Driver `Revert`. Transaction hash recorded; the Track A debit follows. |
-| `Executing` | `Active` | Driver `Cancelled`, `Expired`, or `Fail` (submission abandoned, no transaction landed), or the executing timeout elapsed. Queues the non-settlement debit. |
-| `SettleFailed` | `Penalized` | The Track A escrow debit lands on-chain. Penalty transaction hash recorded. |
+| `candidate` | `submitted` | Selected by `/solve`; persist attribution before returning the solution. |
+| `submitted` | `submitted` | Driver `settlementStarted`; record start evidence only. |
+| `submitted` | `settled` | Driver `success` with a transaction hash. |
+| `submitted`, `lost` | `settleFailed` | Attributable driver `cancelled`; reason `DriverCancelled`. Replace stale loss reasons, including `UnknownOutput` and `SolverOutbid`. |
+| `submitted`, `lost` | `settleFailed` | Driver `revert` with a transaction hash; reason `SettlementReverted`. |
+| `submitted` | `lost` | Driver `expired` or `fail`; reason `UnknownOutput`. |
+| `submitted` | `lost` | Outcome observation window elapsed; `SolverOutbid` if an external fill is observed, otherwise `UnknownOutput`. |
+| `lost` | `settled` | Late driver `success` with a transaction hash; clear the loss reason. |
+| `settleFailed` / `DriverCancelled` | `settled` or `settleFailed` / `SettlementReverted` | Late confirmed success or revert; preserve any existing penalty hash and financial reconciliation. |
+| `settleFailed` / `SettlementReverted` | `settleFailed` / `SettlementReverted` | The revert escrow debit lands; record `penaltyTxHash` without changing the outcome status. |
 
-**Competitive losses are terminal states.** When BYOS picks a winning sub-solver for an order at `/solve` time, all active proposals for that order from *other* sub-solvers are immediately marked `Rejected: SubsolverOutbid`. Proposals from the same sub-solver as the winner are left untouched — BYOS may fall back to a same-solver runner-up within one auction cycle if the best proposal's fee cut breaches the signed limit. When the winning BYOS solution loses the on-chain auction to an external solver, the subsequent simulation revert with reason `"GPv2: order filled"` is translated to `Rejected: SolverOutbid`. Both transitions are recorded in the audit log and exposed through the standard `GET /proposal/{id}` response so sub-solvers can distinguish competitive losses from genuine route failures.
+`penalized` is a legacy response status. Current debit writers preserve the settlement outcome status and record the escrow debit in `penaltyTxHash`.
 
-**Replacement is an activation-time, atomic group transition.** A successfully validated proposal becomes `Active` only if it is still the newest eligible submission for its `(subSolver, orderUid)` group. In that same serialized transaction, it changes every older `Submitted` or `Active` proposal in the group to `Cancelled`; `Executing` proposals are unchanged. This ordering prevents a late incoming POST from reactivating a stale proposal.
+**Status is not financial evidence.** `DriverCancelled` does not prove a
+cancellation transaction was broadcast or mined. The driver supplies no
+cancellation hash; do not invent one or substitute the escrow debit hash.
+`settlementTxHash` records a confirmed success/revert transaction, while
+`penaltyTxHash` records an escrow debit.
 
-`Executing` is entered on `SettlementStarted`, not at `/solve` time, because at `/solve` time we do not yet know we won. It is exempt from the expiry sweep on purpose — the chain enforces the order's real deadline. An abandoned execution returns to `Active`, covering lost notifications and restarts mid-settlement. Success and revert remain terminal.
+A cancellation alone never authorizes a debit. Matching auction/solution start
+and abandonment evidence is required, in either arrival order, for the existing
+non-settlement charge of 10% of snapshotted `c_l`. Timeout-only and ordinary
+competitive losses do not authorize charges. The revert worker selects
+`SettlementReverted` rows, with compatibility for legacy `settleFailed` rows
+whose reason is null; it must never charge `DriverCancelled` as gas + `c_l`.
 
-**Selected proposals survive auction closure.** When `/solve` returns, the auction window closes and all unselected `Submitted` or `Active` proposals for that auction are cancelled with reason `AuctionClosed`. Proposals that were included in the solution are explicitly excluded from this sweep — they remain `Active` so that the driver's subsequent settlement notifications (`SettlementStarted`, `Success`, `Revert`) can still advance them through the settlement states.
+A late confirmed outcome cancels an unsigned abandonment charge. If abandonment
+transaction bytes were already signed or its debit landed, preserve that evidence
+and require manual reconciliation; do not create a second charge or an automatic
+refund. Existing penalty hashes survive corrections. Duplicate and out-of-order
+notifications are idempotent. Historical rows are not automatically reclassified
+or used to initiate new financial actions.
 
-Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a cancellation, replacement, or notification won the race.
-
-**Terminal retention has one knob.** Rejected, sim-failed, expired, and cancelled rows are swept from the active store an hour after reaching the state; consumers observe the terminal state within one polling interval before that happens. The money states — settled, settle-failed, penalized — are never swept. `audit_events` has no deletion path. All proposals, regardless of status, are mirrored to a permanent `proposals_log` table kept in sync by a database trigger; `GET /proposal/{id}` falls back to that log automatically, so a swept proposal is never a 404.
+Transitions serialize on the committed row and only apply from eligible states.
+Selected proposals survive auction closure, while unselected candidates stop
+competing. A success also cancels the same sub-solver's remaining live proposals
+for the order.
 
 ### Rejection reference
 
@@ -538,7 +540,6 @@ Every reason a proposal stops competing, grouped by when it happens:
 | Invalid signature | Malformed signature hex or recovery failure |
 | Proposal expired | `validUntil` is already in the past |
 | Lifetime exceeded | `validUntil` is more than 5 minutes in the future (configurable) |
-| Nonce already used | This sub-solver used the nonce for different signed content; an exact signed replay is idempotent and returns its original id with `202`. |
 | Rate limited | IP or signer rate limit exceeded |
 | Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Applies to proposal submission only, so a sub-solver whose withdrawal is pending can still read and cancel what it has live. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
 
@@ -565,9 +566,9 @@ Every reason a proposal stops competing, grouped by when it happens:
 | Expired | `validUntil` passed |
 | Cancelled | Sub-solver sent a signed `DELETE` |
 | Settled | The proposal won an auction and settled on-chain |
-| Settle failed | Settlement reverted on-chain — triggers a Track A penalty |
+| Settle failed | Driver cancelled (`DriverCancelled`) or settlement reverted (`SettlementReverted`); financial eligibility is independent of status |
 
-Simulation failures are free: only on-chain failures touch escrow.
+Simulation failures are free. Evidence-backed abandonment and on-chain failures follow the existing penalty policy.
 
 ### Settlement outcomes
 
@@ -575,11 +576,12 @@ Outcomes come from the stock CoW driver's `/notify` protocol. There is no chain 
 
 | Notification | Effect |
 |---|---|
-| `SettlementStarted` | `Active` to `Executing` |
-| `Success { transaction }` | `Executing` to `Settled` |
-| `Revert { transaction }` | `Executing` to `SettleFailed`; Track A trigger |
-| `Cancelled`, `Expired`, `Fail` | `Executing` to `Active`; queues the non-settlement debit |
-| Pre-submission kinds | no transition; recorded as audit events |
+| `settlementStarted` | Retain durable start evidence; `submitted` stays unchanged. |
+| `success { transaction }` | `submitted`, `lost`, or `DriverCancelled` to `settled`. |
+| `revert { transaction }` | `submitted`, `lost`, or `DriverCancelled` to `settleFailed` / `SettlementReverted`; existing revert policy. |
+| `cancelled` | `submitted` or `lost` to `settleFailed` / `DriverCancelled`; no transaction hash implied. |
+| `expired`, `fail` | `submitted` to `lost`; existing non-settlement policy still requires matching start and abandonment evidence. |
+| Pre-submission kinds | No transition; recorded as audit evidence. |
 
 Notifications carry auction and solution ids, not proposals, so `/solve` records the `(auction_id, solution_id, proposal_id)` mapping synchronously before returning a solution — if it cannot be recorded, it is not bid. `/notify` joins through that mapping, which doubles as the per-auction participation record. The ids are optional on the wire, so the handler must tolerate notifications it cannot join, but an *outcome* notification that cannot be attributed is an alert-worthy bug.
 
@@ -640,7 +642,7 @@ All four signature schemes are supported, since the scheme is encoded in the tra
 
 **A revert is terminal on the first occurrence.** No strikes, no retry. A proposal that reverted once is not offered to `/solve` — if it won and then reverted on-chain, the sub-solver takes a Track A penalty.
 
-**The profitability gate runs on the single simulation only.** A score of zero or less rejects as unprofitable, matching `/solve`'s own inclusion rule, so one invariant holds: an `Active` proposal is one that could win an auction right now.
+**The profitability gate runs on the single simulation only.** A score of zero or less rejects as unprofitable, matching `/solve`'s own inclusion rule, so one invariant holds: a `candidate` passed the profitability gate at validation time.
 
 **Proposal lifetime is capped at ingestion.** `validUntil` more than the configured maximum in the future is rejected, which bounds worst-case simulation cost per proposal and guarantees the expiry sweep arrives. Sub-solvers already run polling loops, and a route priced longer ago than that is stale anyway. The order's own `validTo` needs no separate handling: once the order expires or fills, simulation reverts and first-revert-terminal rejects at submission.
 
@@ -674,13 +676,11 @@ BYOS is the **solver engine** half of a standard CoW driver and solver pair. The
 
 ### Single-order solutions
 
-**A solution contains exactly one order.** One proposal commits to one order, and one settlement carries one proposal and one sub-solver. Batch proposals are out of scope.
+**One proposal commits to one order.** After choosing at most one winning proposal for each order UID, BYOS combines proposals from the same sub-solver into a solution when their clearing-price vectors are compatible by exact integer scaling. Incompatible prices remain separate candidate solutions. Batch proposals and cross-sub-solver settlements are out of scope.
 
-CoW's original single-winner batch auction rewarded batching, because netting opposing orders peer-to-peer was the winning edge. CIP-67 replaced it with the fair combinatorial auction: reference bids are computed per directed token pair, and a batched bid is filtered out if it underperforms the reference on any pair it covers. Coincidence of wants in a single auction is small, most directed pairs carry one order, and a batch usually has nothing to net. Meanwhile sub-solvers are mainly DEXes and routing APIs that want to quote one order and sign one proposal, not build netting logic.
+Each batch preserves its members' trades, gas cuts, hooks, and transfer/Trampoline interaction pairs. Its gas estimate is the sum of the members' estimates. This allows the driver to submit multiple orders through one winning solution without enabling driver-side merging across sub-solvers. Proposal signatures and the EIP-712 schema remain unchanged.
 
-One invariant follows for everything downstream: every BYOS settlement has exactly one order, one trampoline call, one sub-solver. Relaxing it later is a signed-schema change, needing a domain-version bump.
-
-Settlement overhead is therefore paid per order and never amortized, and netting surplus is out of reach. Both are accepted: bids are scored per solution, and BYOS's niche is per-pair routing bids.
+Every solution ID maps to all of its proposal IDs. Outcomes apply to every member. A reverted settlement incurs one transaction-cost-plus-`c_l` debit against its sub-solver; an abandoned solution records one non-settlement penalty. Successful delivery accounting remains per proposal, using each order's `Executed` event.
 
 ### Scoring
 
@@ -819,7 +819,15 @@ Routine, fast, provable.
 
 Track A is BYOS-unilateral because for reverts and deadline misses everything is on-chain verifiable: the receipt, the gas cost, and the Trampoline CREATE2 address that identifies the sub-solver.
 
-**Non-settlement is detected from driver notifications**: a `Cancelled`, `Expired`, or `Fail` for an `Executing` proposal means the driver confirmed it began submitting and then abandoned the settlement with no transaction landing. That covers both submission failures and the driver's own block deadline. An executing *timeout* is deliberately not charged — a lost notification is not proof of non-settlement. This sub-category rests on BYOS's internal auction records and is not independently verifiable by the sub-solver, which is an accepted trust assumption.
+**Non-settlement requires durable matching driver evidence**: retain both
+`settlementStarted` and a `cancelled`, `expired`, or `fail` notification for the
+same attributed auction and solution. Either arrival order is valid, including
+after the live proposal was removed on timeout. Charge 10% of the snapshotted
+`c_l` exactly once through the durable debit protocol. A proposal status or an
+outcome timeout alone cannot authorize a charge. Confirmed success/revert cancels
+an unsigned abandonment operation; signed or landed conflicts require manual
+reconciliation and block another automatic debit. This evidence rests on BYOS's
+internal auction records, an accepted trust assumption.
 
 **Infra failures are excluded.** A settlement that reverts because of BYOS's own orchestration — a trampoline missing after a deposit-transaction reorg, for instance — is BYOS's cost. The engine must distinguish "sub-solver route reverted" from "BYOS orchestration failed" before debiting.
 
@@ -873,7 +881,7 @@ The 36h sub-solver window is tight, and sub-solvers without responsive operation
 
 **One sub-solver per settlement transaction.** The per-sub-solver Trampoline CREATE2 address in the settlement calldata self-evidences which sub-solver's route ran, with no reliance on BYOS's private records. That is what makes Track A debits indisputable and Track B attribution clean.
 
-The cost is less batching efficiency.
+Batching is limited to proposals from that sub-solver.
 
 Off-chain, notifications carry auction and solution ids rather than proposals, so attribution to a proposal is a join through the `solutions` mapping the engine writes before bidding ([`#proposal-lifecycle`](#proposal-lifecycle)). The Trampoline address in calldata remains the on-chain proof, checked when debiting.
 

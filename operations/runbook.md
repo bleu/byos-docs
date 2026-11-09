@@ -36,7 +36,7 @@ Use the Subsolvers page to identify a sub-solver with an abnormal revert rate or
 
 The Proposals page shows a paginated list of proposals. You can filter by sub-solver address and by status.
 
-Possible statuses: `submitted`, `active`, `rejected`, `simFailed`, `executing`, `settled`, `settleFailed`, `penalized`, `cancelled`, `expired`.
+Current persisted statuses: `submitted`, `rejected`, `simFailed`, `settled`, `settleFailed`, `cancelled`, `expired`, `lost`. Validated `candidate` proposals are held in service memory until selection and are not listed in this database-backed dashboard. Historical rows may also contain legacy `active`, `executing`, or `penalized` values. Current escrow debits populate `penaltyTxHash` without changing the outcome status.
 
 Each row links to the proposal detail page. The detail page shows:
 

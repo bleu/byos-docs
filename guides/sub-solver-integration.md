@@ -73,7 +73,7 @@ One proposal covers one order ([`#single-order-solutions`](../design-document#si
 
 Orders appear in CoW's orderbook only after BYOS receives them from the driver in `/solve`. Do not poll the orderbook before a `/solve` call has arrived — the orders will not be there yet.
 
-A proposal is valid for one auction window only. It does not carry over to the next auction. When BYOS sends its solution to the driver, the auction window closes. Proposals that were `Submitted` or `Active` at that point are cancelled with reason `AuctionClosed`. New POST /proposals requests after the window closes receive `202` until the next auction arrives.
+A candidate is valid for one auction window only. Unselected candidates stop competing when the window closes; selected candidates become durable `submitted` proposals and remain available for driver outcomes. New `POST /proposals` requests after the window closes receive `400 NoActiveAuction` until the next auction arrives.
 
 If an order was not filled in the current auction, submit a new proposal when the next auction opens.
 
@@ -150,13 +150,13 @@ All endpoints are on the public listener (default port 9585):
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `200 {"id": n, "status": "active"}` if validation passes; `400 ProposalRejected` with a typed `reason` if validation fails; `400 noActiveAuction` if no auction is running (proposal not stored); `400 unknownOrder` if the order UID is not in the current auction; `202` in the rare case where the proposal was stored but the auction closed before validation ran. Replaying identical signed content returns the original id with `202`; reusing a nonce with different content returns `409 NonceAlreadyUsed`. |
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `200 {"id": n}` for an in-memory `candidate`; `400 ProposalRejected` with a typed reason in `description` if validation fails; `400 NoActiveAuction` if the auction is unavailable; `400 UnknownOrder` if the order UID is not in the current auction. If validation cannot complete after id allocation, a rejected `AuctionClosed` log entry is retained and the response is `400 NoActiveAuction`. No `202` response or HTTP replay deduplication is provided. |
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
 | `GET` | `/openapi.yaml` | None | Machine-readable OpenAPI 3 spec for the full API. Use this to generate a client or validate your integration. |
 | `GET` | `/buffer-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding buffer balance, the clearing threshold, and individual per-proposal entries. |
-| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Submitted` or `Active` proposals. |
+| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on in-memory `candidate` proposals; selected `submitted` proposals are already with the driver. |
 
 ### Read authentication
 
@@ -166,11 +166,11 @@ If you query a proposal that is not yours, you get `404` (not `403`). You cannot
 
 ### The POST response is the verdict
 
-BYOS validates proposals synchronously on the request path. A `200` response with `{"id": n, "status": "active"}` means the proposal passed escrow and simulation checks and is live in the current auction. A `400 ProposalRejected` response means validation failed — read the typed `reason` and fix the route or amounts. A `400 noActiveAuction` response means no auction is running and the proposal was not stored. A `202` response is a rare race case: the proposal was stored but the auction closed before validation ran; resubmit when the next auction opens.
+BYOS validates proposals synchronously on the request path. A `200` response with `{"id": n}` means the proposal passed escrow and simulation checks and is held in memory as a `candidate`. A `400 ProposalRejected` response means validation failed — read the typed reason in `description` and fix the route or amounts. A `400 NoActiveAuction` response means the auction is unavailable. Before id allocation nothing is stored; after id allocation, if validation cannot complete, a rejected `AuctionClosed` log entry is retained. Resubmit when the next auction opens. There is no deferred `202` response. A repeated signed request is independently validated and can receive a new id.
 
 ### Poll for state changes
 
-Use `GET /proposal/{id}` to track what happens after acceptance: when the proposal moves to `Executing`, `Settled`, or `Cancelled` (replaced by a newer proposal, or closed at auction end).
+Use `GET /proposal/{id}` to track selection from `candidate` to `submitted` and subsequent outcomes such as `settled`, `settleFailed`, or `lost`. There is no separate `executing` status. Escrow debits populate `penaltyTxHash` without changing the outcome status; `penalized` is a legacy response value.
 
 A proposal is valid for the current auction window only. When BYOS closes the auction, the proposal does not carry over. If the order was not filled, submit a new proposal in the next auction.
 
@@ -180,19 +180,18 @@ Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended opera
 
 ### Cancel a proposal
 
-To cancel a proposal before it settles, send a signed `DELETE` request. Proposals are immutable and there is no update operation. To replace one, submit a new proposal with a new nonce: when it validates, BYOS cancels your older submitted or active proposals for that order. Do not cancel first; the old proposal remains usable until the replacement becomes active.
+To cancel an in-memory `candidate`, send a signed `DELETE` request. A selected `submitted` proposal is already with the driver and cannot be cancelled through this API. Proposals are immutable: submit a new signed proposal to compete with a different route. A new submission does not automatically cancel older candidates.
 
 ## 8. Error handling
 
 | What happened | Cost | Action |
 |---|---|---|
 | Rejected at gatekeeping | None | Read the typed rejection reason. Fix the route or the amounts. |
-| `400 noActiveAuction` | None | No `/solve` has arrived yet. BYOS just started or is between auctions. Wait for the next auction and resubmit. |
-| `400 unknownOrder` | None | The order UID is not in the current auction. The order may not have reached BYOS yet. Wait for the next auction. |
+| `400 NoActiveAuction` | None | No `/solve` has arrived yet. BYOS just started or is between auctions. Wait for the next auction and resubmit. |
+| `400 UnknownOrder` | None | The order UID is not in the current auction. The order may not have reached BYOS yet. Wait for the next auction. |
 | Simulation reverted | None (one rate-limit slot used) | The proposal is dropped on the first revert. There are no retries. Resubmit if the route is still valid. |
 | `429` rate limited | None | You are over your budget. Wait out `Retry-After`. Deposit more escrow for a larger budget. |
 | `503` service unavailable | None | A BYOS dependency is down. Wait out `Retry-After` and retry; nothing was lost. |
-| `409 NonceAlreadyUsed` | None | The nonce was already used for different signed content. Generate a new nonce; retrying the exact same signed proposal is safe and returns its original id. |
 | `403` insufficient escrow | None | Your cached balance is below the minimum collateral. Deposit more. Submission only — reads and cancellations keep working. |
 | Expired | None | Your `validUntil` passed. Use a shorter interval. |
 | `AuctionClosed` | None | The auction closed while your proposal was active. Submit a new proposal in the next auction. |
