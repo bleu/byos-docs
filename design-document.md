@@ -684,7 +684,7 @@ Settlement overhead is therefore paid per order and never amortized, and netting
 
 ### Scoring
 
-`score = surplus - gas`, in native-token units.
+`score = surplus - gas`, in native-token units, by default. With `USE_GAS_PROFITABILITY=false`, `score = surplus`: gas is not subtracted during validation or `/solve` selection, and the declared gas cut is zero. BYOS funds settlement gas in this mode. Scores must still be positive, and validation still enforces `MIN_PROPOSAL_SCORE`. Simulation, gas estimation, collateral requirements, and signed order limits remain enforced.
 
 - **Surplus** is the improvement beyond the order's limit price — extra buy tokens on a sell order, sell tokens kept back on a buy order — converted at the auction's reference price.
 - **Gas** is the simulated gas (`call.gasUsed` from `eth_simulateV1`) plus a 30k buffer, cached on the proposal, times the auction's effective gas price. The buffer is small because the full-settle estimate already covers intrinsic gas and the whole settlement path, so it only absorbs warm and cold storage differences and driver batching variance.
@@ -702,11 +702,11 @@ One winner per order UID, filtered and ranked at `/solve` time with local comput
 1. Expiry: `validUntil > now`.
 2. Order liveness: the order UID is present in the auction.
 3. Amount matching against the auction's order state.
-4. Score rank by `surplus - gas`, using cached gas and the auction's prices.
+4. Score rank by `surplus - gas` (or raw surplus with `USE_GAS_PROFITABILITY=false`), using cached gas and the auction's prices.
 5. Gas cut sizing; drop the proposal if taking the cut would breach the user's signed limit.
 6. Select the single highest-scoring proposal per order UID.
 
-A winner with a non-positive score is not returned: settling a trade expected to cost more in gas than it earns in surplus is worse than skipping the order. The escrow re-check is not on this path — the background validator owns it.
+A winner with a non-positive score is not returned. With the default gas profitability setting, this excludes trades expected to cost at least their surplus in gas; opting out still requires positive raw surplus. The escrow re-check is not on this path — the background validator owns it.
 
 **Amount matching is strict, with no clamping.** Fill-or-kill proposals must satisfy the order's limit price using `effectiveBuyAmount` (which is `min(simulationBuyAmount, quoteBuyAmount)`); partially fillable proposals must not exceed the remaining fillable amount. Scoring and clearing prices also use `effectiveBuyAmount`, not the raw `quoteBuyAmount`. BYOS never adapts proposal amounts, because the sub-solver computed a route for specific amounts and changing them would invalidate it. Sub-solvers resubmit through their polling loops when order state moves.
 
@@ -755,7 +755,7 @@ Full mechanics, with worked numbers for both order kinds, are in [`reference/cow
 
 ### The gas cut
 
-**BYOS charges exactly the gas the settlement is estimated to cost, in sell-token units, always on.** No multiplier, no configuration knob. It is *declared* as the fulfillment's fee while the route still carries the full sell amount.
+**BYOS charges exactly the gas the settlement is estimated to cost, in sell-token units, by default.** `USE_GAS_PROFITABILITY` defaults to `true`. Setting it to `false` disables gas subtraction from scoring and declares an explicit zero fulfillment fee, so the user retains the route surplus and BYOS pays settlement gas. Gas estimates are still returned to the driver. It is *declared* as the fulfillment's fee while the route still carries the full sell amount.
 
 Declaring and routing less are separable, and only the first is available: the sub-solver signed for the full `sellAmount`. The wedge lands anyway, because the driver rebuilds clearing prices from the declared execution, so the user receives proportionally less and the difference stays in the settlement's buffers. Nothing reimburses gas — what returns weekly is money BYOS declined to pass on. Using the fee field rather than shading prices keeps `encode_settle` producing the transaction that was simulated, and books the cut as a declared solver fee instead of as slippage.
 
@@ -773,7 +773,7 @@ Amounts in a proposal are **raw pre-fee route amounts**, the same convention a s
 
 Two consequences follow. First, gatekeeping must ensure each proposal leaves room for the gas cut *and* the driver's fee shift above the user's limit price — a sub-solver quoting exactly at the limit produces an infeasible solution. Second, on-chain `settle()` calldata deviates from the signed raw tuples by exactly the driver's fee transform, which is deterministic because policies are public per auction, so a dispute must apply that transform to the signed tuples before comparing.
 
-CIP-74 caps a solver's per-auction reward at a share of the protocol fees its solutions collected, so a settlement collecting no protocol fee earns nothing while BYOS still pays gas. That is why the gas cut is always on.
+CIP-74 caps a solver's per-auction reward at a share of the protocol fees its solutions collected, so a settlement collecting no protocol fee earns nothing while BYOS still pays gas. That is why the gas cut is enabled by default; operators disabling it explicitly accept funding settlement gas.
 
 ## Penalties
 
