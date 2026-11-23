@@ -2,18 +2,18 @@
 
 This guide tells you how to go from zero to a settled proposal.
 
-All normative facts (field names, amounts, signature formats, penalty amounts) are in [the design document](../design-document) or the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml). This guide links to them and does not repeat them. If this guide and one of those disagree, the source document is correct.
+Use this guide with the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) and the contracts for your deployment. The [design document](../design-document) gives background. Its automatic-sweep model differs from the current TypeScript service contract dependency: your route must transfer output to settlement.
 
-You do not need a CoW solver seat, an allowlist entry, or a relationship with CoW DAO. You need an address, collateral in the Escrow, and the ability to sign EIP-712 messages.
+You need an address, collateral in the Escrow, and an EIP-712 signer. You do not need a CoW solver seat. Ask the BYOS operator for access if the deployment restricts proposal submission or auction forwarding.
 
 ## Your role as a sub-solver
 
 **You are responsible for:**
 
-- **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
-- **Order selection.** Find orders in CoW's public orderbook. Compute any route that delivers buy tokens to the GPv2Settlement contract. Assume execution from Trampoline with sell tokens on it.
-- **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. The safest and recommended option is enforcing `minBuyAmount = quoteBuyAmount`. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into loose slippage — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
-- **CoW solver rewards.** BYOS does not forward CoW solver rewards to sub-solvers. To earn on a trade, embed a fee inside your route before the sweep — for example, by routing through a pool you operate or by setting your output amount below what the route actually delivers.
+- **Collateral.** Fund the Escrow to at least the deployment minimum and cover the total exposure of your submitted proposals plus each new proposal.
+- **Order selection.** Discover orders through the orderbook or auction forwarding. Build a route that executes from your Trampoline and delivers buy tokens to `GPv2Settlement`.
+- **Amounts.** Set `minBuyAmount` to the settlement output your route guarantees. Use `quoteBuyAmount = minBuyAmount` unless you accept loose slippage on sell orders. Output below the floor reverts; output below the quote can create a buffer liability. For buy orders, both amounts must be equal.
+- **Income.** BYOS does not forward CoW solver rewards. Collect your fee inside the route. Output sent to settlement above your commitment does not become your fee.
 <!-- - **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade. -->
 
 **You are NOT responsible for:**
@@ -21,15 +21,12 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 - **Transaction submission.** BYOS builds and submits the settlement through the CoW driver. You never call `settle`.
 - **Scoring.** BYOS scores proposals (`surplus - gas`), selects the best one per order, and bids it into CoW's auction.
 - **Gas estimation or fee calculation.** BYOS sizes the gas cut. The driver applies protocol and partner fees. Your amounts are raw, pre-fee route amounts.
-- **Trampoline contract logic.** The sweep, the floor check, and the sandbox isolation are in the contract code. You cannot change them.
+- **Trampoline contract logic.** The contract enforces the floor and isolates your route.
 - **CoW protocol compliance.** BYOS manages the relationship with CoW DAO, the bonding pool, and the reward accounting. But gatekeeping is non-exculpatory. Your signed route is your responsibility.
 
-## Byos Availability
+## Staging deployments
 
-Currently, BYOS is only available in **staging competition** of **BNB chain**.
-
-See [Active deployments](../reference/deployments) for addresses, endpoints, and chain-specific parameters.
-
+Use [Staging deployments](../reference/deployments) for endpoints, contract addresses, and chain parameters.
 
 ## 1. Understand the risks
 
@@ -37,21 +34,26 @@ You compute routes. BYOS bids them into CoW's auction under its own bonded solve
 
 When a settlement that carries your route fails on-chain, BYOS debits the cost from your escrow balance. **BYOS debits this amount without prior approval.** Read the terms in [`#penalties`](../design-document#penalties).
 
-**`minBuyAmount` is the floor, `quoteBuyAmount` is the clearing-price commitment.** The contract enforces `minBuyAmount` as a minimum. If the route delivers less, the settlement reverts. `quoteBuyAmount` is the amount BYOS bids into the auction — it determines the user's price and your score. A [Track A](../design-document#track-a) debit is the penalty for a revert. A `quoteBuyAmount` that is too low loses auctions.
+**The floor and the bid.** The contract reverts if settlement receives less than `minBuyAmount`. BYOS scores and prices the proposal with `min(simulationBuyAmount, quoteBuyAmount)`, then applies the gas cut. A higher quote cannot increase the bid above simulated output.
 
-**Loose slippage (sell orders only).** When you set `minBuyAmount < quoteBuyAmount`, you accept a wider on-chain tolerance. The delta check uses `minBuyAmount`, but the clearing price uses `quoteBuyAmount`. If the route delivers between the two, the difference `quoteBuyAmount − delivered` is converted to native token and recorded as a buffer entry you owe. If the route over-delivers above `quoteBuyAmount`, the difference is recorded as a credit that offsets future shortfalls but is never paid out. Entries accumulate in a ledger — credits offset debits — and BYOS debits your escrow only when the outstanding balance exceeds `c_l`. Monitor your running balance with `GET /buffer-balance` ([API endpoints](#api-endpoints)). For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
+**Loose slippage (sell orders only).** Set `minBuyAmount < quoteBuyAmount` only if you accept the delivery gap. BYOS records `quoteBuyAmount − delivered`, converted to native token, in your buffer ledger. Over-delivery creates a credit that offsets future shortfalls but is never paid out. BYOS debits the full outstanding balance above `MIN_COLLATERAL / 5`. Monitor `GET /buffer-balance`; its current `threshold` field reports `MIN_COLLATERAL`, so divide it by five for the clearing threshold. Buy orders require equal min and quote amounts.
 
-**Slippage limits.** BYOS enforces two per-proposal caps on the gap between `quoteBuyAmount` and `minBuyAmount`: `MAX_PROPOSAL_SLIPPAGE_BPS` (maximum gap as a fraction of `quoteBuyAmount`, in basis points) and `MAX_PROPOSAL_SLIPPAGE_NATIVE` (maximum gap in native token value). Proposals that exceed either limit are rejected at ingestion. See [Active deployments](../reference/deployments) for the current values on each chain.
+**Provider slippage.** Fynd and Binance use the provider's guaranteed minimum for both signed buy amounts. Their swap slippage settings do not create a min/quote gap. Their default provider tolerance is 50 bps, or 5 bps for configured correlated assets.
+
+**Slippage limits.** BYOS enforces two per-proposal caps on the gap between `quoteBuyAmount` and `minBuyAmount`: `MAX_PROPOSAL_SLIPPAGE_BPS` (maximum gap as a fraction of `quoteBuyAmount`, in basis points) and `MAX_PROPOSAL_SLIPPAGE_NATIVE` (maximum gap in native token value). Proposals that exceed either limit are rejected at ingestion. See [Staging deployments](../reference/deployments) for the current values on each chain.
 
 ## 2. Deposit collateral
 
 Deposit native token into the [Escrow](../design-document#escrow) for your address. Any address can fund a sub-solver address. Only the sub-solver address can withdraw.
 
-The deposit causes three effects:
+The deposit deploys your Trampoline at a deterministic address. Resolve it with `TrampolineFactory.addressOf(yourAddress)`. More collateral also increases your API rate limit.
 
-1. **You can submit proposals.** The deposit is the only requirement. The minimum balance must be enough for a single worst-case Track A debit ([`#penalties`](../design-document#penalties)).
-2. **BYOS deploys your [Trampoline](../design-document#topology) instance.** The instance has a deterministic CREATE2 address that is based on your address. You pay this one-time gas cost. All your routes execute in this instance.
-3. **BYOS sets your rate limit.** The rate limit scales with your balance ([`#proposal-api`](../design-document#proposal-api)). A larger deposit gives more throughput.
+Keep enough effective balance for both collateral checks:
+
+1. Hold at least `MIN_COLLATERAL`, the deployment's fixed minimum.
+2. Cover the current proposal plus all your submitted proposals: `sum(c_l + simulatedGas × gasPrice) <= effectiveBalance − max(outstandingBufferBalance, 0)`.
+
+For each proposal, `c_l = min(sellValueNative × COLLATERAL_RATIO_BPS / 10_000, MIN_COLLATERAL)`, rounded down. Positive buffer liabilities reduce available collateral; negative credits cannot cover gas or penalties. Other in-memory candidates are excluded. On `ExposureCapExceeded`, add collateral or wait for submitted proposals to complete. See [collateral gates](../design-document#collateral-gates-and-deployment-penalty-cap).
 
 ### Withdrawal
 
@@ -65,13 +67,16 @@ The new address gets its own Trampoline instance. Your old proposals do not foll
 
 ## 3. Find orders to route
 
-BYOS does not operate an orderbook. Orders come from CoW's orderbook API. Access to the production orderbook may require permission from the CoW team.
+Use one of these discovery methods:
+
+- **Orderbook calls:** poll `GET /api/v1/auction` on the chain's CoW orderbook. Access is easier in staging; production access can require permission from the CoW team.
+- **Auction forwarding:** expose `POST /solve`. Ask the BYOS operator to whitelist your endpoint in `SUBSOLVERS_ENDPOINTS` and agree on `SUBSOLVER_BEARER`. Verify `Authorization: Bearer <token>`. This method is more common in production. Submit signed proposals to BYOS with `POST /proposals`; the `/solve` response is only an acknowledgement.
 
 One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format. Both fill-or-kill and partially fillable orders are supported. For partially fillable orders, your proposal's `sellAmount` can be any amount up to the order's remaining fillable amount, and both `minBuyAmount` and `quoteBuyAmount` must independently satisfy the proportionally scaled limit price.
 
 ## 4. Auction timing
 
-Orders appear in CoW's orderbook only after BYOS receives them from the driver in `/solve`. Do not poll the orderbook before a `/solve` call has arrived — the orders will not be there yet.
+Order discovery does not open the BYOS auction. Submit only for orders in BYOS's active auction. For forwarded auctions, finish quoting and submission before `deadline` minus the operator's `SELECTOR_BUFFER_MS` (default 200 ms). Allow time for BYOS to simulate the proposal during submission.
 
 A candidate is valid for one auction window only. Unselected candidates stop competing when the window closes; selected candidates become durable `submitted` proposals and remain available for driver outcomes. New `POST /proposals` requests after the window closes receive `400 NoActiveAuction` until the next auction arrives.
 
@@ -83,9 +88,15 @@ A route is a list of raw calls. Each call has a target, a value, and calldata. Y
 
 ### Sandbox constraints
 
-Your Trampoline instance holds only the sell amount that BYOS pushes in for this settlement. The instance has no allowance over `GPv2Settlement`. It has no access to other sub-solver instances. The instance is empty between settlements ([`#topology`](../design-document#topology)).
+BYOS transfers the signed `sellAmount` to your Trampoline before execution. Your calls execute as the Trampoline. Include the token approvals that your route needs, then deliver at least `minBuyAmount` to `GPv2Settlement`. Set the swap receiver to settlement or add an explicit transfer. The contract checks the settlement balance increase; it does not sweep trade tokens.
 
-A route that tries to access protocol buffers gets nothing. A route that plants an approval for future use against a funded contract gets nothing.
+Your instance cannot use settlement funds or other instances. Remaining tokens stay in your instance. Recover them with `claimToken`, and manage any approvals that can spend them.
+
+### Native tokens and order hooks
+
+Use the auction's token addresses in your proposal. For a native buy, quote the wrapped native token at the provider and deliver it to settlement; keep the auction's `buyToken` in the signed proposal. BYOS restores the user's signed order for simulation, and the driver handles native payout. Do not add a second unwrap.
+
+Do not add the order's own pre/post hooks to your route. BYOS includes them in simulation; the driver includes them at settlement. Orders with `flashloanHint` use BYOS's flash-loan router. Reject general Atomic Bundle orders with `wrappers`, and orders with non-ERC20 balance sources or destinations; BYOS rejects them as `UnsupportedOrder`.
 
 ### Headroom
 
@@ -95,103 +106,54 @@ Sign **raw, pre-fee route amounts**. Do not pre-subtract fees. The driver create
 
 ### Private market makers
 
-If you are a private market maker (MM) holding your own inventory, the Trampoline is your execution sandbox — not your funds contract. The standard routing pattern (compute a DEX route, let the Trampoline execute it) does not apply; instead, your route transfers buy tokens from your own contract into the settlement.
+Keep inventory in your own funds contract or EOA. Approve only your Trampoline to spend the buy token. Include these calls in your signed route:
 
-**Why not hold inventory in the Trampoline?** The Trampoline receives sell tokens only because BYOS encodes a `sellToken.transfer(trampoline, sellAmount)` interaction in the settlement. If that transfer is omitted — due to a bug or compromise — your route still executes and delivers buy tokens, but you never receive the sell tokens. Routing sub-solvers are not exposed to this: their routes consume sell tokens through DEX swaps, so a missing funding transfer simply reverts the route. An MM transferring from its own inventory has no such natural guard.
+1. `sellToken.transfer(yourFundsAddress, sellAmount)` to receive payment and fail if the input is missing.
+2. `buyToken.transferFrom(yourFundsAddress, GPv2Settlement, minBuyAmount)` to deliver output.
 
-**Recommended pattern:**
-
-1. Deploy your own funds contract (or use an EOA) to hold buy-token inventory.
-2. Grant an ERC-20 approval from your funds contract to your Trampoline instance.
-3. Your signed route includes two interactions:
-   - `buyToken.transferFrom(yourContract, GPv2Settlement, buyAmount)` — delivers output directly to the settlement through the Trampoline.
-   - `sellToken.transfer(yourContract, sellAmount)` — forwards the sell tokens the Trampoline received to your contract, before the sweep.
-4. The Trampoline's sweep sends any remaining balances back to the settlement. The delta check enforces `minBuyAmount` as usual.
-
-Your inventory is safe: the approval is to your Trampoline instance only (isolated per sub-solver), and the route is committed via `interactionsHash` in your EIP-712 signature — BYOS cannot substitute different interactions.
-
-If your route does not explicitly forward sell tokens before the sweep, you can retrieve them post-settlement via `claimToken`.
-
-**Not recommended but not prevented:** you may deposit tokens directly into your Trampoline instance and trust BYOS to always include the funding transfer. BYOS has no incentive to omit it, but the trust assumption is stronger than necessary.
+Recover remaining tokens with `claimToken`. The signature commits to both calls.
 
 ## 6. Sign the proposal
 
-Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). The `ProposalData` struct has nine fields: `orderUidHash`, `sellToken`, `buyToken`, `sellAmount`, `minBuyAmount`, `quoteBuyAmount`, `interactionsHash`, `validUntil`, `nonce`. Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
+Use `byosDomain` and `signProposal` from `packages/common`, or implement the [proposal schema](../design-document#proposal-schema). The domain uses your chain ID and TrampolineFactory address. Update both when the deployment changes. Verify hashes against the deployment contract's test vectors.
 
-The API verifies your signature at submission. The Trampoline verifies the same signature on-chain at settlement. If the two do not match, the settlement fails.
-
-### Domain binding
-
-The EIP-712 domain binds to the TrampolineFactory address. The domain is specific to a chain **and** a deployment generation. A contracts v2 deployment invalidates all outstanding signatures. Update your domain configuration when contracts change.
-
-### Route commitment
-
-The `interactionsHash` field in the signed struct commits to your route. BYOS cannot substitute different interactions. A third party can verify that the signed data matches the settlement calldata. This property makes Track A debits verifiable.
-
-### Expiry
-
-Keep `validUntil` short. BYOS caps it at ingestion ([`#proposal-lifecycle`](../design-document#proposal-lifecycle)). A route that is more than a few minutes old is stale.
-
-### Contract signers (EIP-1271)
-
-If your sub-solver is a smart contract, set `subSolverAddress` in the POST body to your contract's address. The service tries ECDSA first; if that does not match, it calls `isValidSignature` on your contract. `subSolverAddress` is your identity: it is the escrow key and the Trampoline CREATE2 salt. It must match the address that holds collateral in the Escrow.
-
-The signature is not limited to 65 bytes. The Trampoline uses `SignatureChecker` on-chain, so service and contract apply identical verification.
-
-If your contract is upgradeable or has a mutable owner, dispute attribution may not hold after the fact. Use a non-upgradeable signer if dispute resolution matters.
+Sign all nine `ProposalData` fields: `orderUidHash`, `sellToken`, `buyToken`, `sellAmount`, `minBuyAmount`, `quoteBuyAmount`, `interactionsHash`, `validUntil`, and `nonce`. `interactionsHash` commits to the exact route. Use a new nonce for each new proposal, and keep `validUntil` within the deployment limit.
 
 ## 7. Submit and poll
 
-Send a `POST` request with the proposal. See the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for the payload format, status codes, and rejection reasons.
+Use the public BYOS endpoint (default port 9585). See [OpenAPI](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for JSON fields and error responses.
 
-### API endpoints
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/proposals` | Submit a signed proposal. `200 {"id": n}` means validation passed and the candidate is in memory. |
+| `GET` | `/proposal/{id}` | Read your candidate, submitted proposal, or permanent log entry. |
+| `GET` | `/proposals/{order_uid}` | List your in-flight proposals for an order. |
+| `GET` | `/proposals/by-sub-solver` | List all your in-flight proposals. |
+| `GET` | `/buffer-balance` | Read your buffer balance and entries. Divide the current `threshold` field by five for the clearing threshold. |
+| `DELETE` | `/proposal/{id}` | Cancel your candidate. Returns `409 AlreadySubmitted` after submission to the driver. |
+| `GET` | `/openapi.yaml` | Read the API schema. No authentication required. |
 
-All endpoints are on the public listener (default port 9585):
-
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a proposal. Returns `200 {"id": n}` for a candidate; errors include `400 ProposalRejected`, `400 NoActiveAuction`, and `400 UnknownOrder`. See the response rules below. |
-| `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
-| `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
-| `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
-| `GET` | `/openapi.yaml` | None | Machine-readable OpenAPI 3 spec for the full API. Use this to generate a client or validate your integration. |
-| `GET` | `/buffer-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding buffer balance, the clearing threshold, and individual per-proposal entries. |
-| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Candidate` proposals (in-memory, not yet submitted). Returns `409 AlreadySubmitted` if the proposal has already been sent to the driver. |
+For proposal lists, use `?includeArchived=true` to query the permanent log instead.
 
 ### Read authentication
 
-Sign an EIP-712 `ReadAuth { version: 1 }` message once. Send it in the `X-Signature` header with every `GET` request. This signature has no timestamp or nonce. If it leaks, the risk is limited to read access to your own proposals. The signature does not grant write or cancellation access.
+Sign `ReadAuth { version: 1 }` once with the proposal domain. Send it in `X-Signature` for authenticated reads. This signature grants read access only. A proposal owned by another address returns `404`.
 
-If you query a proposal that is not yours, you get `404` (not `403`). You cannot check if a proposal id exists.
-
-### The response to POST is acceptance
-
-A `200 {"id": n}` response means the proposal passed validation and is a candidate in memory. For `400 ProposalRejected`, read the reason in `description`. For `400 NoActiveAuction`, wait for the next auction and resubmit. If the auction closes after ID allocation, BYOS keeps a rejected `AuctionClosed` log entry. Repeated signed requests can receive new IDs.
+For `DELETE`, sign `CancelProposal { proposalId }` with the same domain and send it in `X-Signature`. Use `signReadAuth` and `signCancellation` from `packages/common`.
 
 ### Poll for status
 
 Poll `GET /proposal/{id}` after acceptance. You can see only your own proposals. See [SLO targets](../operations/slo-targets).
 
-Once the proposal has been selected in an auction, the response includes four price snapshot fields: `sellTokenRefPrice`, `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices`. These are the auction-time prices used to score and settle the proposal. They are absent until the first auction selection and never change afterwards.
+Treat price fields as nullable. `sellTokenRefPrice` can be present on candidates. The permanent log also retains `buyTokenRefPrice` for rejected and other outcomes before selection. Selection records `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices` for the submitted bid.
 
-A proposal that was not selected at `/solve` time (because another sub-solver won the order, or the auction closed) is written directly to the log with reason `SubsolverOutbid` or `AuctionClosed`. You will see this on `GET /proposal/{id}`.
+Unselected candidates enter the log as `SubsolverOutbid` or `AuctionClosed`. A submitted proposal with no observed driver outcome becomes `lost`: `SolverOutbid` means an on-chain trade was found; `UnknownOutput` means none was found. A late driver outcome can correct `lost`.
 
-A submitted proposal may be marked `lost` by the outcome worker if no driver outcome is observed within the window. This is provisional: a late driver `Success` or `Revert` notification corrects it. The `lost` state carries a sub-reason: `SolverOutbid` (an on-chain Trade event was found for the order — an external solver settled it) or `UnknownOutput` (no Trade event found; the solution was dropped or abandoned).
-
-A `settleFailed` outcome includes a reason:
-
-| Reason | Meaning |
-|---|---|
-| `DriverCancelled` | The driver cancelled submission; this alone does not authorize a penalty. |
-| `SettlementReverted` | The settlement reverted on-chain; the existing Track A policy applies. |
-
-`settlementTxHash` identifies the settlement transaction. `penaltyTxHash` identifies an escrow debit. Late confirmed outcomes can correct a cancellation while preserving existing debit evidence.
+For `settleFailed`, read `rejectionReason`: `DriverCancelled` does not by itself authorize a debit; `SettlementReverted` follows Track A. `settlementTxHash` identifies the settlement and `penaltyTxHash` identifies an escrow debit. Late confirmed outcomes can correct a cancellation and preserve debit evidence.
 
 Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended operating mode.
 
-### Cancel a proposal
-
-Send a signed `DELETE` request to cancel a candidate. Once BYOS sends it to the driver, cancellation returns `409 AlreadySubmitted`. To offer a new route, submit a new proposal with a new nonce. The earlier candidate remains until you cancel it or selection ends.
+To replace a route, cancel the earlier candidate and submit a new proposal with a new nonce. A new submission does not cancel an earlier candidate.
 
 ## 8. Error handling
 
@@ -210,24 +172,20 @@ Send a signed `DELETE` request to cancel a candidate. Once BYOS sends it to the 
 | `SolverOutbid` | None | The submitted proposal was lost to an external solver (on-chain Trade event found). Resubmit or move to the next order. |
 | `Lost/UnknownOutput` | None (provisional) | The outcome worker found no driver outcome within the window and no on-chain trade. May be corrected by a late driver notification. |
 | Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
-| BYOS won but did not settle | Smaller Track A debit | Same dispute window and grounds. |
+| Settlement started, then abandoned | 10% of frozen `c_l`, once | Debit requires matching driver start and abandonment evidence. You have a 72-hour dispute window. |
 <!-- | CoW raised an EBBO or fairness claim | [Track B](../design-document#track-b) passthrough | BYOS freezes your balance and sends you the certificate and evidence. | -->
 
 ### Rate limits: `429` and `503`
 
-Your requests share one budget across `POST`, `GET` and `DELETE`, scaled by your escrow balance. A larger deposit buys more throughput. Size your polling against the budget: polling every live proposal on a short interval is what consumes it, and writes are cheap by comparison.
+`POST`, `GET`, and `DELETE` share an escrow-based budget. Reserve capacity for status reads; use `GET /proposals/by-sub-solver` to synchronize multiple proposals in one request.
 
-A `429` means you exceeded that budget, or the per-IP limit in front of it. A `503` means a store BYOS depends on is unreachable — infrastructure, not load. The two are deliberately separate so you can tell them apart in your own logs.
+On `429` or `503`, stop requests until `Retry-After` seconds have passed, then retry. `429` means the signer or IP budget is exhausted; `503` means a dependency is unavailable. The current Fynd and Binance clients defer later cycles on `429`, but can continue the current submission batch. They do not handle `503` retry headers. Your client must handle both.
 
-Both carry a `Retry-After` header, in seconds. Honour it. The reference clients do not, and that is a limitation of the examples rather than a pattern to copy: a client that retries at full rate through a `429` gets nothing back sooner and keeps its own counter pinned.
-
-A `403` with `InsufficientEscrow` on submission means BYOS has a cached balance for your address that is below the minimum collateral. Deposit more; the gate clears within one refresh interval. An address BYOS has not seen before is not rejected — it is admitted at the lowest rate tier.
-
-The gate is on submission alone. Reading and cancelling keep working at any balance, deliberately: requesting a withdrawal drops your effective balance to zero, and you still need to cancel and watch whatever you have live while it winds down.
+On `403 InsufficientEscrow`, deposit more collateral and allow one balance refresh interval. Reads and cancellations remain available during withdrawal and at low balances. An unknown address enters at the lowest rate tier; validation still checks its collateral.
 
 ### Simulation failures
 
-Simulation failures do not cost escrow. Only on-chain failures cause escrow debits. If a revert is caused by BYOS's own orchestration (not your route), BYOS pays.
+Simulation failures do not cost escrow. A loss, timeout, or cancellation alone does not authorize a non-settlement debit. BYOS requires matching `settlementStarted` and `cancelled`, `expired`, or `fail` notifications for the same auction and solution. BYOS pays for reverts caused by its own orchestration.
 
 <!-- ### Track B operational readiness
 
@@ -239,14 +197,17 @@ Every penalty action emits an on-chain Escrow event. You can use these events to
 
 ## 9. Reference implementations
 
-| Language | Location |
-|---|---|
-| **Rust** | [`crates/subsolver`](https://github.com/bleu/byos-service/tree/main/crates/subsolver) in `byos-service` |
-| **TypeScript** | [`apps/subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/subsolver) in `byos-service-ts` |
-| **TypeScript** | [`apps/fynd-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/fynd-subsolver) in `byos-service-ts` |
-| **TypeScript** | [`apps/private-mm-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/private-mm-subsolver) in `byos-service-ts` |
+Use the TypeScript examples in [`byos-service-ts`](https://github.com/bleu/byos-service-ts):
 
-The protocol is language-neutral. Use either example for the sequence, the EIP-712 construction, and the polling behavior. The [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) specifies all wire-level details.
+| Component | Use |
+|---|---|
+| [`apps/fynd-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/fynd-subsolver) | Fynd routing on BNB Chain |
+| [`apps/binance-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/binance-subsolver) | Binance routing and both discovery methods |
+| [`packages/subsolver-core`](https://github.com/bleu/byos-service-ts/tree/main/packages/subsolver-core) | Proposal signing, API client, discovery, and request budget |
+| [`apps/baseline-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/baseline-subsolver) | Baseline client and end-to-end test example |
+| [`apps/private-mm-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/private-mm-subsolver) | Inventory-based routes |
+
+Fynd and Binance currently submit sell orders only. Use the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for request and response formats.
 
 ## Pre-launch checklist
 

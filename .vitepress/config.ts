@@ -42,7 +42,10 @@ export default withMermaid({
       },
       {
         text: 'Guides',
-        items: [{ text: 'Sub-solver integration', link: '/guides/sub-solver-integration' }],
+        items: [
+          { text: 'Sub-solver integration', link: '/guides/sub-solver-integration' },
+          { text: 'Staging deployments', link: '/reference/deployments' },
+        ],
       },
       {
         text: 'Operations',
