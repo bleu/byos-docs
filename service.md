@@ -148,12 +148,12 @@ The audit trail uses a write-behind pattern: events are emitted after their prop
 score = surplus - gas
 ```
 
+Gas profitability is mandatory. The service no longer supports the `USE_GAS_PROFITABILITY` opt-out.
+
 - **Surplus**: improvement beyond the order's limit price (extra buy tokens on a sell order, sell tokens kept back on a buy order), computed from `quoteBuyAmount` and converted at the auction's reference price.
 - **Gas**: simulated `eth_estimateGas` result + 30k buffer, times the auction's effective gas price.
 
 There is no fee term. CoW's score is `surplus + protocol fees`, and the protocol fee cancels out of ranking. Once the gas cut equals the gas cost, `surplus - gas` matches what the autopilot computes.
-
-`USE_GAS_PROFITABILITY` defaults to `true`. With `USE_GAS_PROFITABILITY=false`, validation and `/solve` score raw surplus without subtracting gas, and declare a zero gas cut. BYOS funds settlement gas. Positive surplus, `MIN_PROPOSAL_SCORE`, signed order limits, simulation, gas estimation, and collateral checks still apply.
 
 BYOS's score is a **pre-ranking** that decides which proposals deserve the driver's encoding budget. The driver re-scores after encoding and simulation.
 
