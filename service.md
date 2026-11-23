@@ -31,6 +31,8 @@ flowchart LR
 
 `POST /proposals` checks the signature, expiry, escrow, order envelope, and simulation before returning. A `200` means the proposal is a candidate. A `400` means it failed validation or the auction is unavailable. Candidates remain in memory until selection; a restart loses them.
 
+Before simulation, require `effectiveBalance >= MIN_COLLATERAL`. After simulation, check exposure against the available collateral. Admission is concurrent and can exceed escrow; see [collateral gates](design-document#collateral-gates-and-deployment-penalty-cap).
+
 For EOA sub-solvers the signature verification is a pure `ecrecover` — no RPC, no state. For contract sub-solvers (`subSolverAddress` present in the POST body) the service tries `ecrecover` first; if that does not match the declared address it falls back to one `eth_call` invoking `isValidSignature` on the contract. See [`#proposal-schema`](#proposal-schema).
 
 ### Solving (internal)
@@ -64,7 +66,7 @@ Processes Track A debits and post-settlement buffer accounting:
 
 1. For each `SettleFailed` proposal: fetch settlement tx receipt, compute `gas_used × effective_gas_price + frozen c_l`, call `escrow.debit(subSolver, amount, txHash)`.
 2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × frozen c_l, orderUidHash)`.
-3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `proposals_log` row), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `c_l`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
+3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `proposals_log` row), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `MIN_COLLATERAL / 5`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
 4. On success: transition to `Penalized` (for Track A), record the debit tx hash.
 5. Retry up to 10 times on transient failures, then park for operator investigation.
 
@@ -77,45 +79,6 @@ Processes Track A debits and post-settlement buffer accounting:
 | Terminal outcome | `proposals_log` | No |
 
 Terminal rows leave `proposals` immediately. Reads fall back to `proposals_log`, which retains the outcome. See [the state diagram and transitions](design-document#proposal-lifecycle).
-
-## Retention sweep
-
-Runs every ~5 minutes. Removes terminal proposals (`Rejected`, `SimFailed`, `Expired`, `Cancelled`) from the active store once they have been in their terminal state for more than 1 hour. Money states (`Settled`, `SettleFailed`, `Penalized`) are never swept — they are dispute evidence.
-
-Swept proposals are not lost: every proposal is mirrored to a permanent `proposals_log` table by a database trigger. `GET /proposal/{id}` falls back to that log automatically, and the list endpoints accept `?includeArchived=true` to query it directly.
-
-## Proposal lifecycle
-
-```mermaid
-stateDiagram-v2
-    [*] --> Submitted: POST /proposals
-    Submitted --> Active: simulation passes,\nscore > 0
-    Submitted --> Rejected: gatekeeping fails
-    Submitted --> SimFailed: simulation reverts
-    Active --> Executing: driver SettlementStarted
-    Submitted --> Cancelled: newer proposal activates\nor AuctionClosed
-    Active --> Cancelled: newer proposal activates\nor AuctionClosed
-    Submitted --> Expired: validUntil passed
-    Active --> Expired: validUntil passed
-    Submitted --> Cancelled: DELETE
-    Active --> Cancelled: DELETE
-    Active --> Settled: driver Success\n(missed Started)
-    Active --> SettleFailed: driver Revert\n(missed Started)
-    Executing --> Settled: driver Success
-    Executing --> SettleFailed: driver Revert
-    Executing --> Active: driver Cancelled/Fail,\nor timeout
-    SettleFailed --> Penalized: Track A debit lands
-```
-
-A state answers one question: **what does the service do with this proposal right now?**
-
-| State | Simulated? | Offered to `/solve`? | Cancellable? |
-|---|---|---|---|
-| `Submitted` | Inline on POST | No | Yes |
-| `Active` | No | Yes | Yes |
-| `Executing` | No | No | No |
-| `Rejected` / `SimFailed` / `Expired` / `Cancelled` | No | No | No |
-| `Settled` / `SettleFailed` / `Penalized` | No | No | No |
 
 `POST /proposals` validates once and returns `200` for a candidate or `400` for rejection. The candidate store does not enforce nonce uniqueness or return the original ID on replay. Use a new nonce for each new route; the Trampoline enforces replay protection on-chain.
 
