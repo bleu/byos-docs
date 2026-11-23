@@ -150,7 +150,7 @@ All endpoints are on the public listener (default port 9585):
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Validates inline; returns `200 OK` with an id on success. Replaying identical signed content returns the original id; reusing its nonce with different signed content returns `409 NonceAlreadyUsed`. |
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Validates inline; returns `200 OK` with an id on success. Use a new nonce for each new route. |
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
@@ -170,11 +170,9 @@ A `200 OK` response means the proposal passed inline validation — escrow check
 
 ### Poll for status
 
-After you submit, poll for status with `GET /proposal/{id}`. You can see only your own proposals. Proposals are validated exactly once at submission time, on the request path; there is no background re-validation tick. See [SLO targets](../operations/slo-targets).
+Poll `GET /proposal/{id}` after acceptance. You can see only your own proposals. See [SLO targets](../operations/slo-targets).
 
 Once the proposal has been selected in an auction, the response includes four price snapshot fields: `sellTokenRefPrice`, `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices`. These are the auction-time prices used to score and settle the proposal. They are absent until the first auction selection and never change afterwards.
-
-A submitted proposal (one that has been sent to the driver) cannot be cancelled. A `DELETE` against a submitted proposal returns `409 AlreadySubmitted`.
 
 A proposal that was not selected at `/solve` time (because another sub-solver won the order, or the auction closed) is written directly to the log with reason `SubsolverOutbid` or `AuctionClosed`. You will see this on `GET /proposal/{id}`.
 
@@ -184,7 +182,7 @@ Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended opera
 
 ### Cancel a proposal
 
-To cancel a candidate proposal before it is submitted to the driver, send a signed `DELETE` request. Cancel only works on candidates (proposals held in memory that have not yet been selected at `/solve`). A `DELETE` against a submitted proposal returns `409 AlreadySubmitted`. Proposals are immutable and there is no update operation. To replace one, submit a new proposal with a new nonce.
+Send a signed `DELETE` request to cancel a candidate. Once BYOS sends it to the driver, cancellation returns `409 AlreadySubmitted`. To offer a new route, submit a new proposal with a new nonce. The earlier candidate remains until you cancel it or selection ends.
 
 ## 8. Error handling
 
@@ -196,7 +194,6 @@ To cancel a candidate proposal before it is submitted to the driver, send a sign
 | Simulation reverted | None (one rate-limit slot used) | The proposal is dropped on the first revert. There are no retries. Resubmit if the route is still valid. |
 | `429` rate limited | None | You are over your budget. Wait out `Retry-After`. Deposit more escrow for a larger budget. |
 | `503` service unavailable | None | A BYOS dependency is down. Wait out `Retry-After` and retry; nothing was lost. |
-| `409 NonceAlreadyUsed` | None | The nonce was already used for different signed content. Generate a new nonce; retrying the exact same signed proposal is safe and returns its original id. |
 | `403` insufficient escrow | None | Your cached balance is below the minimum collateral. Deposit more. Submission only — reads and cancellations keep working. |
 | Expired | None | Your `validUntil` passed. Use a shorter interval. |
 | `SubsolverOutbid` | None | BYOS selected a different sub-solver for this order at `/solve` time. Resubmit with a better route for the next auction. |
