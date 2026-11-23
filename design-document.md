@@ -599,7 +599,24 @@ The driver knows the transaction hash and whether it reverted, but not what it c
 
 ### Simulation
 
-Each proposal is simulated as the transaction the driver would actually submit: a real `settle()` on `GPv2Settlement` carrying the real order, via `eth_simulateV1` (Geth's `blockStateCalls` API).
+Simulate orders with `flashloanHint` through
+`FlashLoanRouter.flashLoanAndSettle()`. Preserve the settlement calldata and order
+hooks. Borrowing, settlement, and repayment must all succeed. Use the full outer
+call gas for scoring and collateral checks.
+
+At startup, read `FlashLoanRouter[chainId].address` from
+[`networks.json`](https://github.com/cowprotocol/flash-loan-router/blob/main/networks.json).
+If the lookup fails, is invalid, or exceeds five seconds, use
+`0x9da8b48441583a2b93e2ef8213aad0ec0b392c69`. Set `FLASH_LOAN_ROUTER` to override
+this address. Configure the driver with the same router. Before rollout, verify
+that the router is deployed and that the real submitter and router have solver
+authorization; the simulation's authenticator override does not check this.
+
+General Atomic Bundles (`wrappers` with `wrappedSettle`) are unsupported. Reject
+orders with any wrapper as `UnsupportedOrder`, including optional wrappers, and
+exclude them from selection.
+
+Simulate the real order with `eth_simulateV1` (Geth's `blockStateCalls` API). Ordinary orders call `GPv2Settlement.settle()` directly. Flash loan orders wrap that call through the router described above.
 
 ```
 eth_simulateV1 blockStateCalls[0]:
@@ -741,7 +758,7 @@ The driver's `SolutionMerging` is set to **`Forbidden`**, because the driver mer
 | `interactions` | the two custom entries above, not internalized |
 | `pre_interactions`, `post_interactions`, `wrappers` | empty; the driver appends the order's own hooks |
 | `gas` | simulated gas plus the 30k buffer — the same number the cut is priced from |
-| `flashloans` | none |
+| `flashloans` | omitted; the driver copies hints for fulfilled orders into the final transaction |
 
 The fee field is never absent because **every real order is limit class**: order validation assigns `Limit` when the signed `feeAmount` is zero, and every order has signed zero since the 2023 fee-model change. A fulfillment accepts a static fee only for market-class orders, so a missing fee is rejected on every order BYOS bids — and DTO conversion collects into a result, so one invalid trade discards *every* solution in the response. Quote requests invert this, since the driver's synthetic quote order is market class; that path is unreachable today but is a trap for anyone adding quoting deliberately.
 
