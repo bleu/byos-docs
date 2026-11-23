@@ -52,6 +52,8 @@ flowchart LR
 
 ### Settlement outcomes (internal)
 
+Driver cancellations use `settleFailed / DriverCancelled`; mined reverts use `settleFailed / SettlementReverted`. A cancellation requires matching start and abandonment evidence before the non-settlement debit is eligible. Late confirmed outcomes can correct it. Preserve signed or landed debit evidence for reconciliation.
+
 The CoW driver reports outcomes through `POST /notify`. BYOS uses the proposal ID to look up the live row, then the permanent log. See [settlement outcomes](design-document#settlement-outcomes) for notification handling and late corrections.
 
 ## Background workers
@@ -64,7 +66,7 @@ Every `OUTCOME_WORKER_INTERVAL_SECS` (default 60 seconds), check submitted propo
 
 Processes Track A debits and post-settlement buffer accounting:
 
-1. For each `SettleFailed` proposal: fetch settlement tx receipt, compute `gas_used × effective_gas_price + frozen c_l`, call `escrow.debit(subSolver, amount, txHash)`.
+1. For each `settleFailed` / `SettlementReverted` proposal (including legacy null reasons with a settlement hash): fetch settlement tx receipt, compute `gas_used × effective_gas_price + frozen c_l`, call `escrow.debit(subSolver, amount, txHash)`.
 2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × frozen c_l, orderUidHash)`.
 3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `proposals_log` row), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `MIN_COLLATERAL / 5`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
 4. After a Track A debit succeeds, set `proposals_log.penalty_tx_hash`. Keep the proposal status unchanged.
@@ -89,6 +91,7 @@ Terminal rows leave `proposals` immediately. Reads fall back to `proposals_log`,
 | `audit_events` | Append-only event history and dispute evidence |
 | `buffer_entries` | Signed delivery gaps; clear net debt above `MIN_COLLATERAL / 5` |
 | `debit_operations` | Durable escrow debit queue; `proposals_log.penalty_tx_hash` records completion |
+| `settlement_attempts`, `settlement_attempt_members`, `settlement_notifications` | Attributed start, abandonment, and chain-outcome evidence |
 
 Audit events are written by a background worker after the proposal write commits. A crash between those writes can leave a state change without its audit event.
 
