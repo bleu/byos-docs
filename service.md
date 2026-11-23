@@ -99,6 +99,8 @@ Audit events are written by a background worker after the proposal write commits
 
 `score = surplus - gas`. Calculate surplus from `effectiveBuyAmount = min(simulationBuyAmount, quoteBuyAmount)` and the order's limit, using auction reference prices. Gas is the simulated estimate plus the configured overhead, multiplied by the auction gas price. The driver applies protocol fees and scores the encoded solution again.
 
+Gas profitability is mandatory. The service no longer supports the `USE_GAS_PROFITABILITY` opt-out.
+
 ## Gas cut
 
 Keep the estimated settlement gas cost in sell-token atoms:
