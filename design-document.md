@@ -67,7 +67,7 @@ Becoming a CoW solver today is a gated process:
 | Onboarding | Shadow competition and testing on Sepolia before mainnet access | Same requirement |
 | Compliance | KYC through the vouching solver's pool | Same |
 
-An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. BYOS drops the barrier to a collateral deposit subject to a flat entry floor and a post-simulation exposure check and the ability to sign an EIP-712 message and return a route.
+An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. To participate in BYOS, a router must deposit collateral, pass the collateral checks, sign an EIP-712 message, and return a route.
 
 ### Responsibility split
 
@@ -809,7 +809,7 @@ Track A and Track B penalties for the same settlement **stack**. There is no cre
 
 **On shortfall**, BYOS drains the remaining balance and absorbs the difference. The sub-solver is suspended (zero collateral means ineligible). There is no permanent ban and no debt tracking.
 
-The fixed v1 policy is superseded for deployments adopting the collateral-ratio policy through a coordinated service/database migration. Announce the policy and deployment parameters before admitting proposals under it; do not silently reprice historical charges. Further policy changes likewise require an announced migration. Contract immutability is unchanged.
+Deployments adopt this collateral policy through an announced service and database migration. Announce the parameters before accepting proposals. Keep historical charges unchanged. Later policy changes also require an announced migration. The escrow contract remains immutable.
 
 ### Collateral gates and deployment penalty cap
 
@@ -835,30 +835,23 @@ currentExposure + sum(active/executing sibling exposures)
 exposure = c_l + simulatedGas * gasPrice
 ```
 
-Equality passes. Independent orderbook, database, and balance reads overlap;
-simulation starts after its order data and envelope checks are available. The
-current proposal uses fresh simulated gas on initial validation and every
-revalidation, and is counted once. Unknown sibling gas reserves 200,000 gas;
-legacy unpriced active/executing rows reserve the absolute cap until revalidated.
-Successful production validation always supplies a positive reference price.
-Submitted siblings are excluded. Older active routes replaced by acceptance are
-excluded too; executing routes remain reserved. An unpriced pending replacement
-never invalidates its existing active route. Negative buffer credits offset
-shortfalls only and cannot fund gas or penalties.
+Equality passes. Each proposal uses its latest simulated gas and is counted once.
+If sibling gas is unknown, reserve 200,000 gas. For active or executing rows
+without a price, reserve the absolute cap until revalidation.
+Exclude submitted siblings and older active routes that acceptance replaces.
+Keep executing routes reserved. An unpriced pending replacement does not
+invalidate its existing active route. Negative buffer credits can offset
+shortfalls but cannot cover gas or penalties.
 
-Admission is deliberately concurrent, without a per-sub-solver collateral lock.
-Two validations may pass against the same snapshot and activate exposure above
-escrow. BYOS accepts that shortfall risk; this gate is best effort, not a strict
-reservation system. A proposal rejected at Gate 2 has already consumed simulation
-work. Snapshot changes during simulation are part of the same accepted risk.
+Admission has no per-sub-solver lock. Concurrent validations can accept more
+exposure than escrow can cover. BYOS accepts this shortfall risk. Gate 2 runs
+after simulation, so a rejection still consumes simulation work.
 
-Each auction solution stores its cap synchronously with attribution before the
-bid is returned. Revert outcomes freeze that cap on the proposal; abandonment
-creates a penalty with its own frozen cap. Later validation prices and auctions
-do not change an existing charge. Validation prices are stored separately from
-auction evidence. Rows predating cap snapshots use the deployment's absolute
-cap as a conservative fallback. Pending penalty evidence survives retention,
-including when a signed debit awaits recovery.
+Store each solution's cap with its auction attribution before returning the bid.
+Revert and non-settlement charges use this frozen cap. Later prices and auctions
+do not change the charge. Keep validation prices separate from auction evidence.
+Use the absolute cap for legacy rows without a cap snapshot. Retain unresolved
+penalty evidence, including signed debits that await recovery.
 
 ### Track A
 
