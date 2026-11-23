@@ -1,5 +1,8 @@
 # CoW Protocol — Fee Collection & Enforcement (reference)
 
+> Historical protocol reference. For current BYOS collateral and penalties, see
+> [the design document](../design-document#collateral-gates-and-deployment-penalty-cap).
+
 > Consolidated from the official docs, the settlement contract source, and the autopilot code.
 > Captured 2026-07-21 while analyzing fee handling for BYOS. Sources:
 > [settlement contract docs](https://docs.cow.fi/cow-protocol/reference/contracts/core/settlement),
