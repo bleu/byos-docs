@@ -589,28 +589,24 @@ This covers cases a block scanner would miss, including private submissions and 
 
 ### Simulation
 
-Orders with a driver-provided `flashloanHint` are simulated through the dedicated
-CoW `FlashLoanRouter.flashLoanAndSettle()` entry point, wrapping the same settlement
-calldata and preserving the order's pre/post hooks. The outer call must succeed,
-including borrowing and repayment; its full gas usage backs scoring and collateral
-exposure. Failed borrowing or repayment never activates a proposal.
+Simulate orders with `flashloanHint` through
+`FlashLoanRouter.flashLoanAndSettle()`. Preserve the settlement calldata and order
+hooks. Borrowing, settlement, and repayment must all succeed. Use the full outer
+call gas for scoring and collateral checks.
 
-At startup, BYOS fetches
-[`networks.json`](https://github.com/cowprotocol/flash-loan-router/blob/main/networks.json)
-and resolves `FlashLoanRouter[chainId].address`. A five-second timeout, HTTP error,
-invalid JSON/schema/address, or missing chain entry uses
-`0x9da8b48441583a2b93e2ef8213aad0ec0b392c69` instead. `FLASH_LOAN_ROUTER`
-overrides resolution for local/custom deployments. The driver must be configured
-for flash loans with the same router, and both submitter and router must have the
-necessary solver authorization. This fallback does not imply deployment on every
-chain. The existing dummy authenticator override is not a deployment authorization
-check; verify permissions with the real submitter before rollout.
+At startup, read `FlashLoanRouter[chainId].address` from
+[`networks.json`](https://github.com/cowprotocol/flash-loan-router/blob/main/networks.json).
+If the lookup fails, is invalid, or exceeds five seconds, use
+`0x9da8b48441583a2b93e2ef8213aad0ec0b392c69`. Set `FLASH_LOAN_ROUTER` to override
+this address. Configure the driver with the same router. Before rollout, verify
+that the router is deployed and that the real submitter and router have solver
+authorization; the simulation's authenticator override does not check this.
 
-General Atomic Bundles (`wrappers`, using `wrappedSettle`) are not supported yet.
-Orders declaring any such wrappers, including omittable ones, are rejected as
-`UnsupportedOrder` and excluded from selection, including cached candidates.
+General Atomic Bundles (`wrappers` with `wrappedSettle`) are unsupported. Reject
+orders with any wrapper as `UnsupportedOrder`, including optional wrappers, and
+exclude them from selection.
 
-Each proposal is simulated as the transaction the driver would actually submit: a real `settle()` on `GPv2Settlement` carrying the real order, via `eth_simulateV1` (Geth's `blockStateCalls` API).
+Simulate the real order with `eth_simulateV1` (Geth's `blockStateCalls` API). Ordinary orders call `GPv2Settlement.settle()` directly. Flash loan orders wrap that call through the router described above.
 
 ```
 eth_simulateV1 blockStateCalls[0]:
