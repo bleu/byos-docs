@@ -493,6 +493,8 @@ A state answers exactly one question: what does the service do with this proposa
 | `Settled` | DB (proposals → proposals_log on delete) | no | no | permanent log |
 | `SettleFailed` | DB (proposals_log) | no | no | permanent log |
 
+Penalty payment does not change the proposal status. Record a completed Track A debit in `proposals_log.penalty_tx_hash`.
+
 Every transition:
 
 | From | To | Trigger |
@@ -594,7 +596,7 @@ A background job runs every `OUTCOME_WORKER_INTERVAL_SECS` (default 60s). It fin
 - Trade event found → `Lost/SolverOutbid`
 - No trade event → `Lost/UnknownOutput`
 
-The worker marks the row `lost` and deletes the live row. A subsequent driver notification takes precedence over this provisional outcome.
+The worker records `lost` in the permanent log and deletes the live row. A late driver outcome can correct this provisional result.
 
 **Attribution:** The driver and outcome worker both use `proposal.id` directly as the `solutionId` in `/solve` responses. There is no `solutions` join table. `/notify` looks up proposals by ID in `proposals` first, then in `proposals_log` (for rows already deleted by the outcome worker or a previous notification).
 
