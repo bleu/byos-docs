@@ -24,12 +24,9 @@ You need an address, collateral in the Escrow, and an EIP-712 signer. You do not
 - **Trampoline contract logic.** The contract enforces the floor and isolates your route.
 - **CoW protocol compliance.** BYOS manages the relationship with CoW DAO, the bonding pool, and the reward accounting. But gatekeeping is non-exculpatory. Your signed route is your responsibility.
 
-## Byos Availability
+## Staging deployments
 
-Currently, BYOS is only available in **staging competition** of **BNB chain**.
-
-See [Active deployments](../reference/deployments) for addresses, endpoints, and chain-specific parameters.
-
+Use [Staging deployments](../reference/deployments) for endpoints, contract addresses, and chain parameters.
 
 ## 1. Understand the risks
 
@@ -43,7 +40,7 @@ When a settlement that carries your route fails on-chain, BYOS debits the cost f
 
 **Provider slippage.** Fynd and Binance use the provider's guaranteed minimum for both signed buy amounts. Their swap slippage settings do not create a min/quote gap. Their default provider tolerance is 50 bps, or 5 bps for configured correlated assets.
 
-**Slippage limits.** BYOS enforces two per-proposal caps on the gap between `quoteBuyAmount` and `minBuyAmount`: `MAX_PROPOSAL_SLIPPAGE_BPS` (maximum gap as a fraction of `quoteBuyAmount`, in basis points) and `MAX_PROPOSAL_SLIPPAGE_NATIVE` (maximum gap in native token value). Proposals that exceed either limit are rejected at ingestion. See [Active deployments](../reference/deployments) for the current values on each chain.
+**Slippage limits.** BYOS enforces two per-proposal caps on the gap between `quoteBuyAmount` and `minBuyAmount`: `MAX_PROPOSAL_SLIPPAGE_BPS` (maximum gap as a fraction of `quoteBuyAmount`, in basis points) and `MAX_PROPOSAL_SLIPPAGE_NATIVE` (maximum gap in native token value). Proposals that exceed either limit are rejected at ingestion. See [Staging deployments](../reference/deployments) for the current values on each chain.
 
 ## 2. Deposit collateral
 
@@ -148,7 +145,7 @@ For `DELETE`, sign `CancelProposal { proposalId }` with the same domain and send
 
 Poll `GET /proposal/{id}` after acceptance. You can see only your own proposals. See [SLO targets](../operations/slo-targets).
 
-Once the proposal has been selected in an auction, the response includes four price snapshot fields: `sellTokenRefPrice`, `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices`. These are the auction-time prices used to score and settle the proposal. They are absent until the first auction selection and never change afterwards.
+Treat price fields as nullable. `sellTokenRefPrice` can be present on candidates. The permanent log also retains `buyTokenRefPrice` for rejected and other outcomes before selection. Selection records `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices` for the submitted bid.
 
 Unselected candidates enter the log as `SubsolverOutbid` or `AuctionClosed`. A submitted proposal with no observed driver outcome becomes `lost`: `SolverOutbid` means an on-chain trade was found; `UnknownOutput` means none was found. A late driver outcome can correct `lost`.
 
