@@ -150,13 +150,13 @@ All endpoints are on the public listener (default port 9585):
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `200 {"id": n}` for an in-memory `candidate`; `400 ProposalRejected` with a typed reason in `description` if validation fails; `400 NoActiveAuction` if the auction is unavailable; `400 UnknownOrder` if the order UID is not in the current auction. If validation cannot complete after id allocation, a rejected `AuctionClosed` log entry is retained and the response is `400 NoActiveAuction`. No `202` response or HTTP replay deduplication is provided. |
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a proposal. Returns `200 {"id": n}` for a candidate; errors include `400 ProposalRejected`, `400 NoActiveAuction`, and `400 UnknownOrder`. See the response rules below. |
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
 | `GET` | `/openapi.yaml` | None | Machine-readable OpenAPI 3 spec for the full API. Use this to generate a client or validate your integration. |
 | `GET` | `/buffer-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding buffer balance, the clearing threshold, and individual per-proposal entries. |
-| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on in-memory `candidate` proposals; selected `submitted` proposals are already with the driver. |
+| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Candidate` proposals (in-memory, not yet submitted). Returns `409 AlreadySubmitted` if the proposal has already been sent to the driver. |
 
 ### Read authentication
 
@@ -164,23 +164,34 @@ Sign an EIP-712 `ReadAuth { version: 1 }` message once. Send it in the `X-Signat
 
 If you query a proposal that is not yours, you get `404` (not `403`). You cannot check if a proposal id exists.
 
-### The POST response is the verdict
+### The response to POST is acceptance
 
 A `200 {"id": n}` response means the proposal passed validation and is a candidate in memory. For `400 ProposalRejected`, read the reason in `description`. For `400 NoActiveAuction`, wait for the next auction and resubmit. If the auction closes after ID allocation, BYOS keeps a rejected `AuctionClosed` log entry. Repeated signed requests can receive new IDs.
 
-### Poll for state changes
+### Poll for status
 
-Use `GET /proposal/{id}` to track selection from `candidate` to `submitted` and subsequent outcomes such as `settled`, `settleFailed`, or `lost`. There is no separate `executing` status. Escrow debits populate `penaltyTxHash` without changing the outcome status; `penalized` is a legacy response value.
-
-A proposal is valid for the current auction window only. When BYOS closes the auction, the proposal does not carry over. If the order was not filled, submit a new proposal in the next auction.
+Poll `GET /proposal/{id}` after acceptance. You can see only your own proposals. See [SLO targets](../operations/slo-targets).
 
 Once the proposal has been selected in an auction, the response includes four price snapshot fields: `sellTokenRefPrice`, `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices`. These are the auction-time prices used to score and settle the proposal. They are absent until the first auction selection and never change afterwards.
+
+A proposal that was not selected at `/solve` time (because another sub-solver won the order, or the auction closed) is written directly to the log with reason `SubsolverOutbid` or `AuctionClosed`. You will see this on `GET /proposal/{id}`.
+
+A submitted proposal may be marked `lost` by the outcome worker if no driver outcome is observed within the window. This is provisional: a late driver `Success` or `Revert` notification corrects it. The `lost` state carries a sub-reason: `SolverOutbid` (an on-chain Trade event was found for the order — an external solver settled it) or `UnknownOutput` (no Trade event found; the solution was dropped or abandoned).
+
+A `settleFailed` outcome includes a reason:
+
+| Reason | Meaning |
+|---|---|
+| `DriverCancelled` | The driver cancelled submission; this alone does not authorize a penalty. |
+| `SettlementReverted` | The settlement reverted on-chain; the existing Track A policy applies. |
+
+`settlementTxHash` identifies the settlement transaction. `penaltyTxHash` identifies an escrow debit. Late confirmed outcomes can correct a cancellation while preserving existing debit evidence.
 
 Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended operating mode.
 
 ### Cancel a proposal
 
-To cancel an in-memory `candidate`, send a signed `DELETE` request. A selected `submitted` proposal is already with the driver and cannot be cancelled through this API. Proposals are immutable: submit a new signed proposal to compete with a different route. A new submission does not automatically cancel older candidates.
+Send a signed `DELETE` request to cancel a candidate. Once BYOS sends it to the driver, cancellation returns `409 AlreadySubmitted`. To offer a new route, submit a new proposal with a new nonce. The earlier candidate remains until you cancel it or selection ends.
 
 ## 8. Error handling
 
@@ -194,9 +205,10 @@ To cancel an in-memory `candidate`, send a signed `DELETE` request. A selected `
 | `503` service unavailable | None | A BYOS dependency is down. Wait out `Retry-After` and retry; nothing was lost. |
 | `403` insufficient escrow | None | Your cached balance is below the minimum collateral. Deposit more. Submission only — reads and cancellations keep working. |
 | Expired | None | Your `validUntil` passed. Use a shorter interval. |
-| `AuctionClosed` | None | The auction closed while your proposal was active. Submit a new proposal in the next auction. |
-| `SubsolverOutbid` | None | BYOS selected a different sub-solver for this order. Resubmit with a better route for the next auction. |
-| `SolverOutbid` | None | BYOS won the internal competition but an external solver settled the order first. Resubmit or move to the next order. |
+| `SubsolverOutbid` | None | BYOS selected a different sub-solver for this order at `/solve` time. Resubmit with a better route for the next auction. |
+| `AuctionClosed` | None | The auction ended without selecting this candidate. Resubmit for the next auction. |
+| `SolverOutbid` | None | The submitted proposal was lost to an external solver (on-chain Trade event found). Resubmit or move to the next order. |
+| `Lost/UnknownOutput` | None (provisional) | The outcome worker found no driver outcome within the window and no on-chain trade. May be corrected by a late driver notification. |
 | Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
 | BYOS won but did not settle | Smaller Track A debit | Same dispute window and grounds. |
 <!-- | CoW raised an EBBO or fairness claim | [Track B](../design-document#track-b) passthrough | BYOS freezes your balance and sends you the certificate and evidence. | -->

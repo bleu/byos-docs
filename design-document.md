@@ -67,7 +67,7 @@ Becoming a CoW solver today is a gated process:
 | Onboarding | Shadow competition and testing on Sepolia before mainnet access | Same requirement |
 | Compliance | KYC through the vouching solver's pool | Same |
 
-An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. BYOS drops the barrier to a collateral deposit sized to cover one worst-case revert penalty (`gas + c_l`) and the ability to sign an EIP-712 message and return a route.
+An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. To participate in BYOS, a router must deposit collateral, pass the collateral checks, sign an EIP-712 message, and return a route.
 
 ### Responsibility split
 
@@ -431,11 +431,9 @@ struct CancelProposal {
 }
 ```
 
-Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Candidates compete within the current auction; a new submission does not replace older candidates. Only selected candidates become `submitted`.
+Proposals are immutable. Submit a new signed proposal with a new nonce to offer a different route. Candidates can coexist until selection; a new submission does not cancel an earlier one. Nonces prevent replay on-chain; the candidate store does not enforce API idempotency.
 
-**Nonces protect on-chain execution.** The TypeScript service does not use `(subSolver, nonce)` as an HTTP idempotency key. A repeated signed submission is validated independently and can receive a new proposal id. Do not rely on a retry returning the original id or on an off-chain `409 NonceAlreadyUsed` check; the Trampoline enforces nonce consumption when executing the signed proposal.
-
-**Ingestion is synchronous.** The request path validates proposals inline: parse, verify the signature, check the expiry window, then run the escrow check and settlement simulation. For EOA sub-solvers, signature verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. A `200` response with `{"id": n}` means the proposal passed all checks and is an in-memory `candidate` in the current auction. A `400 ProposalRejected` means validation failed; the error `description` carries the typed rejection reason. With no active auction, the service returns `400 NoActiveAuction` before allocating an id or storing a proposal. If validation cannot complete after an id is allocated (including auction closure), the service records a rejected `AuctionClosed` log entry and still returns `400 NoActiveAuction`. Neither case returns `202`; retry when an auction is available.
+**Ingestion is synchronous.** `POST /proposals` validates inline: parse, verify the signature, check the expiry window, then run the escrow check and settlement simulation. For EOA sub-solvers, signature verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. A `200` means the proposal passed and is a candidate. A `400 ProposalRejected` gives the typed reason in `description`. `400 NoActiveAuction` means the auction is unavailable. If it closes during validation, BYOS retains an `AuctionClosed` log entry.
 
 **Rate limiting is two-layer and escrow-tiered.** A coarse per-IP limit sheds floods before any cryptography; a per-signer limit applies after `ecrecover`, scaled by escrow balance tier, and a signer known to be below the minimum escrow is rejected once a balance is known. That rejection applies to submission only: effective escrow balance reads as zero from the moment a sub-solver requests a withdrawal, so gating reads and cancellations too would leave a sub-solver winding down unable to cancel, or even see, the proposals it still has live. An address the service has not seen before is admitted at the lowest tier rather than rejected, since absence of a cached balance is not evidence of an empty one. The escrow balance behind the second layer is cached so the request path does no RPC. The two limits are operational tuning parameters; what this document fixes is the two-layer structure. Well-capitalized sub-solvers get higher throughput, which is consistent with the collateral-gated permission model.
 
@@ -455,7 +453,7 @@ Stage 1 sits at the edge because a request rejected there costs no socket, no `e
 
 **Two listeners, one process.** A public port serves `/proposals`; a firewalled internal port serves `/solve` and `/notify`. They never share a socket, because their trust boundaries are opposite: the proposal API must be internet-reachable, while a `/solve` response is the full standing proposal book for an auction — amounts, routes, and signatures, all MEV-relevant. Origin is enforced by network topology rather than path obscurity; an optional bearer token on `/solve` is defense in depth, not a replacement. The split also prevents public traffic from starving the latency-critical path.
 
-**Persistence is Postgres, in two tables with different jobs.** The `proposals` table holds what *is* — current state, single source of truth, read and written by `GET`, `/solve`, `/notify`, and the validator. The append-only `audit_events` table holds what *happened*, written behind an unbounded channel by a separate task, and is the dispute evidence for Track B claims that arrive up to three months later. Emission is in the store by construction, so a new mutation path cannot forget to leave evidence. The service refuses to start without a reachable database and applied migrations, retries forever during a runtime outage, and drains the queue on shutdown. There is no deletion path for the audit log.
+**Persistence is Postgres, with a live table and a permanent log.** The `proposals` table holds only submitted proposals awaiting outcome — rows are deleted on terminal state. The permanent `proposals_log` records submitted proposals through a database trigger and rejected or unselected proposals through direct writes. Late outcomes can update log rows. The append-only `audit_events` table holds what *happened*, written behind an unbounded channel by a separate task, and is the dispute evidence for Track B claims that arrive up to three months later. Emission is in the store by construction, so a new mutation path cannot forget to leave evidence. The service refuses to start without a reachable database and applied migrations, retries forever during a runtime outage, and drains the queue on shutdown. There is no deletion path for the audit log.
 
 The write-behind leaves a small crash window: an audit event is emitted only after its proposal write commits, so a crash between the two leaves a durable state change with no matching event. Closing it would couple every store write to the audit codec and remove the writer's retry isolation. Accepted, at one event per crash.
 
@@ -473,6 +471,8 @@ stateDiagram-v2
     [*] --> Candidate: validation passes
     Candidate --> Submitted: selected by /solve
     Candidate --> Cancelled: DELETE or auction closes
+    [*] --> Rejected: validation fails
+    [*] --> SimFailed: simulation reverts
     Submitted --> Settled: driver success with transaction
     Submitted --> SettleFailed: driver revert or cancelled
     Submitted --> Lost: expired, fail, or outcome timeout
@@ -510,6 +510,14 @@ A late confirmed outcome cancels an unsigned abandonment debit. If the debit is 
 
 Selected proposals survive auction closure. A success cancels the same sub-solver's remaining live proposals for the order.
 
+**Candidates remain in memory until selection.** BYOS allocates an ID before returning acceptance. A restart loses candidates; sub-solvers must resubmit them.
+
+**Selection records the outcome.** `/solve` inserts selected candidates into `proposals` and writes unselected candidates to `proposals_log` before returning. Unselected candidates receive `SubsolverOutbid` or `AuctionClosed`.
+
+**Terminal outcomes stay in the log.** A database trigger copies submitted proposals and their final state to `proposals_log` before deletion from `proposals`. `GET /proposal/{id}` checks memory, the live table, then the log.
+
+Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a notification or outcome worker won the race.
+
 ### Rejection reference
 
 Every reason a proposal stops competing, grouped by when it happens:
@@ -522,30 +530,40 @@ Every reason a proposal stops competing, grouped by when it happens:
 | Proposal expired | `validUntil` is already in the past |
 | Lifetime exceeded | `validUntil` is more than 5 minutes in the future (configurable) |
 | Rate limited | IP or signer rate limit exceeded |
-| Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Applies to proposal submission only, so a sub-solver whose withdrawal is pending can still read and cancel what it has live. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
+| Insufficient escrow (floor gate) | The signer's cached balance is known to be below the minimum collateral. Applies to proposal submission only. Read from cache, never RPC; an address BYOS has not seen before is admitted at the lowest rate tier instead |
 
-**At validation (synchronous, on the POST request path)**
+**At validation (inline on the request path)**
 
 | Reason | Meaning |
 |---|---|
-| Insufficient escrow | Balance below the threshold (`gas estimate × gas price + minimum collateral`) |
+| Insufficient escrow | Balance below the flat minimum, or post-simulation exposure above available collateral (see collateral gates) |
 | Order not found | Order UID not in the current auction |
-| Unsupported order | Non-ERC20 balance flavors, bridging orders, or (in v1) partially fillable orders |
-| Amount mismatch | Proposal amounts don't match the order (fill-or-kill mismatch, or partial fill violates limits) |
+| Unsupported order | Non-ERC20 balance flavors, bridging orders, or partially fillable orders |
+| Amount mismatch | Proposal amounts don't match the order |
 | Proposed slippage outrange | Gap between `minBuyAmount` and `quoteBuyAmount` exceeds the configured bps or native-token cap (sell orders only) |
-| Unprofitable | Score (`surplus - gas`) is zero or negative on simulation |
-| Simulation failed | The full settlement simulation reverted — terminal on first occurrence, no retries |
+| Unprofitable | Score (`surplus - gas`) is zero or negative on first simulation |
+| Simulation failed | The full settlement simulation reverted — terminal |
 | Simulation missing Executed event | Simulation succeeded but the Trampoline did not emit an `Executed` event — terminal |
-| `SubsolverOutbid` | BYOS selected a different sub-solver's proposal for this order at `/solve` time |
-| `SolverOutbid` | The BYOS solution was sent to the driver but an external solver won the on-chain auction (`"GPv2: order filled"` revert) |
-| `AuctionClosed` | The auction window closed before this proposal was selected; submitted as `Cancelled` |
 
-**By lifecycle (not a rejection, but the proposal stops competing)**
+**At auction close**
+
+| Reason | Meaning |
+|---|---|
+| `SubsolverOutbid` | Another sub-solver was selected for this order at `/solve` time |
+| `AuctionClosed` | The auction ended and this candidate was not selected |
+| `Cancelled` | Sub-solver sent a signed `DELETE` |
+
+**Post-submission (recorded as `Lost` with sub-reason)**
+
+| Reason | Meaning |
+|---|---|
+| `SolverOutbid` | On-chain `Trade` event found for the order in the outcome window — an external solver (or another BYOS solution) settled the order |
+| `UnknownOutput` | No `Trade` event found; the solution was dropped, abandoned, or the order was cancelled |
+
+**By lifecycle (not a rejection)**
 
 | State | Cause |
 |---|---|
-| Expired | `validUntil` passed |
-| Cancelled | Sub-solver sent a signed `DELETE` |
 | Settled | The proposal won an auction and settled on-chain |
 | Settle failed | Driver cancelled (`DriverCancelled`) or settlement reverted (`SettlementReverted`); financial eligibility is independent of status |
 
@@ -553,7 +571,9 @@ Simulation failures are free. Evidence-backed abandonment and on-chain failures 
 
 ### Settlement outcomes
 
-Outcomes come from the stock CoW driver's `/notify` protocol. There is no chain watcher and no driver fork.
+Outcomes come from the stock CoW driver's `/notify` protocol and from a background outcome worker.
+
+**Driver notifications (`/notify`):**
 
 | Notification | Effect |
 |---|---|
@@ -564,11 +584,18 @@ Outcomes come from the stock CoW driver's `/notify` protocol. There is no chain 
 | `expired`, `fail` | `submitted` to `lost`; existing non-settlement policy still requires matching start and abandonment evidence. |
 | Pre-submission kinds | No transition; recorded as audit evidence. |
 
-Notifications carry auction and solution ids, not proposals, so `/solve` records the `(auction_id, solution_id, proposal_id)` mapping synchronously before returning a solution — if it cannot be recorded, it is not bid. `/notify` joins through that mapping, which doubles as the per-auction participation record. The ids are optional on the wire, so the handler must tolerate notifications it cannot join, but an *outcome* notification that cannot be attributed is an alert-worthy bug.
+**Outcome worker:**
+
+A background job runs every `OUTCOME_WORKER_INTERVAL_SECS` (default 60s). It finds `submitted` proposals that have been waiting longer than a fixed window (~2 minutes) and checks whether their order appeared in a recent `Settlement.Trade` event on-chain:
+
+- Trade event found → `Lost/SolverOutbid`
+- No trade event → `Lost/UnknownOutput`
+
+The worker records `lost` in the permanent log and deletes the live row. A late driver outcome can correct this provisional result.
+
+**Attribution:** `/solve` uses the proposal ID as `solutionId`. `/notify` checks `proposals` first, then `proposals_log`. Notification IDs are optional on the wire. An outcome that cannot be matched to a proposal requires an operator alert.
 
 The driver knows the transaction hash and whether it reverted, but not what it cost. BYOS makes one `eth_getTransactionReceipt` call on a reverted hash to read the real gas used and gas price. That read is how the debit amount is obtained, not a double-check.
-
-This covers cases a block scanner would miss, including private submissions and dropped transactions, and missed-deadline detection comes free from `Expired` and `Cancelled`. A lost `Revert` notification costs that settlement's Track A debit unless recovered by hand from the audit trail and the chain.
 
 ### Simulation
 
@@ -623,11 +650,11 @@ All four signature schemes are supported, since the scheme is encoded in the tra
 
 **A revert is terminal on the first occurrence.** No strikes, no retry. A proposal that reverted once is not offered to `/solve` — if it won and then reverted on-chain, the sub-solver takes a Track A penalty.
 
-**The profitability gate runs on the single simulation only.** A score of zero or less rejects as unprofitable, matching `/solve`'s own inclusion rule, so one invariant holds: a `candidate` passed the profitability gate at validation time.
+**The profitability gate runs once, at submission time (inline on `POST /proposals`).** A score of zero or less rejects as unprofitable. Since proposals are validated exactly once, there is no concept of re-validation or re-simulation.
 
-**Proposal lifetime is capped at ingestion.** `validUntil` more than the configured maximum in the future is rejected, which bounds worst-case simulation cost per proposal and guarantees the expiry sweep arrives. Sub-solvers already run polling loops, and a route priced longer ago than that is stale anyway. The order's own `validTo` needs no separate handling: once the order expires or fills, simulation reverts and first-revert-terminal rejects at submission.
+**Proposal lifetime is capped at ingestion.** `validUntil` more than the configured maximum in the future is rejected, which limits how long a signed route remains valid. Sub-solvers already run polling loops, and a route priced longer ago than that is stale anyway. The order's own `validTo` needs no separate handling: once the order expires or fills, simulation reverts and first-revert-terminal rejects at submission.
 
-There is no background re-simulation. Each proposal is simulated once, at submission time. The driver's own post-encoding re-simulation catches proposals that go stale in between. `Executing` proposals are never simulated.
+The driver checks the encoded settlement again before submission.
 
 ### Slippage protection
 
@@ -683,7 +710,7 @@ One winner per order UID, filtered and ranked at `/solve` time with local comput
 5. Gas cut sizing; drop the proposal if taking the cut would breach the user's signed limit.
 6. Select the single highest-scoring proposal per order UID.
 
-A winner with a non-positive score is not returned: settling a trade expected to cost more in gas than it earns in surplus is worse than skipping the order. The escrow re-check is not on this path — the background validator owns it.
+A winner with a non-positive score is not returned: settling a trade expected to cost more in gas than it earns in surplus is worse than skipping the order. There is no escrow re-check on this path — escrow was validated once, inline at submission.
 
 **Amount matching is strict, with no clamping.** Fill-or-kill proposals must satisfy the order's limit price using `effectiveBuyAmount` (which is `min(simulationBuyAmount, quoteBuyAmount)`); partially fillable proposals must not exceed the remaining fillable amount. Scoring and clearing prices also use `effectiveBuyAmount`, not the raw `quoteBuyAmount`. BYOS never adapts proposal amounts, because the sub-solver computed a route for specific amounts and changing them would invalidate it. Sub-solvers resubmit through their polling loops when order state moves.
 
@@ -706,7 +733,7 @@ The driver's `SolutionMerging` is set to **`Forbidden`**, because the driver mer
 
 | Field | Value |
 |---|---|
-| `id` | index within this response, 1-based; recorded against the proposal id so `/notify` can be attributed |
+| `id` | the proposal's own `id` (allocated at `POST /proposals` time); used directly as the `solutionId` so `/notify` can attribute by lookup without a join table |
 | `prices` | cross-multiplied from `quoteBuyAmount` and `sellAmount`; unaffected by the cut, which is a declared fee rather than a price shade |
 | `trades` | exactly one fulfillment |
 | `trades[0].fee` | the gas cut, in sell-token atoms — never absent |
@@ -775,13 +802,53 @@ CoW's own framework has four enforcement layers ([`reference/cow-solver-slashing
 
 Track A and Track B penalties for the same settlement **stack**. There is no crediting of one against the other: if a settlement causes both a revert and an EBBO ruling, the sub-solver pays both, because the proposal caused both problems.
 
-`c_l` is read from CoW's reward mechanism at debit time, with a hardcoded fallback for v1. Current values: **0.010 ETH** on Ethereum, **10 xDAI** on Gnosis.
+`c_l` follows the deployment policy below and is frozen with auction attribution, rather than recomputed at debit time.
 
-**Minimum escrow balance** is sized to cover worst-case Track A for a single settlement, `gas + c_l`.
+**Minimum escrow balance** is a flat floor; the separate cumulative collateral gate covers simulated gas and penalty exposure as described below.
 
 **On shortfall**, BYOS drains the remaining balance and absorbs the difference. The sub-solver is suspended (zero collateral means ineligible). There is no permanent ban and no debt tracking.
 
-The **policy is immutable for v1**. No unilateral updates; a change requires a v2 policy with a new escrow deployment or a migration.
+Deployments adopt this collateral policy through an announced service and database migration. Announce the parameters before accepting proposals. Keep historical charges unchanged. Later policy changes also require an announced migration. The escrow contract remains immutable.
+
+### Collateral gates and deployment penalty cap
+
+The TypeScript service uses a deployment policy inspired by CIP-87:
+
+```
+sellValueNative = floor(sellAmount * sellTokenNativePrice / 10^18)
+c_l = min(floor(sellValueNative * COLLATERAL_RATIO_BPS / 10_000), MIN_COLLATERAL)
+```
+
+`COLLATERAL_RATIO_BPS` defaults to 4 integer basis points. `MIN_COLLATERAL`
+defaults to 10^16 native-token wei and serves as both the minimum escrow floor
+and absolute per-proposal cap. This is a BYOS deployment policy, not an exact
+implementation of CoW's current cap calculation: pair-specific/fractional
+factors, buy-side valuation, and a dynamic USD bound remain deferred.
+
+Gate 1 requires `effectiveBalance >= MIN_COLLATERAL` before simulation. Gate 2
+runs after simulation and requires:
+
+```
+currentExposure + sum(submitted sibling exposures)
+    <= effectiveBalance - max(outstandingBufferBalance, 0)
+exposure = c_l + simulatedGas * gasPrice
+```
+
+Equality passes. Count the current candidate once, using its simulated gas.
+Include submitted proposals for the same sub-solver. Other in-memory candidates
+are excluded. If a submitted proposal has no gas estimate, reserve 200,000 gas;
+if it has no price, reserve the absolute cap. Negative buffer credits offset
+shortfalls but cannot cover gas or penalties.
+
+Admission has no per-sub-solver lock. Concurrent validations can accept more
+exposure than escrow can cover. BYOS accepts this shortfall risk. Gate 2 runs
+after simulation, so a rejection still consumes simulation work.
+
+Store each solution's cap with its auction attribution before returning the bid.
+Revert and non-settlement charges use this frozen cap. Later prices and auctions
+do not change the charge. Keep validation prices separate from auction evidence.
+Use the absolute cap for legacy rows without a cap snapshot. Retain unresolved
+penalty evidence, including signed debits that await recovery.
 
 ### Track A
 
@@ -796,15 +863,7 @@ Routine, fast, provable.
 
 Track A is BYOS-unilateral because for reverts and deadline misses everything is on-chain verifiable: the receipt, the gas cost, and the Trampoline CREATE2 address that identifies the sub-solver.
 
-**Non-settlement requires durable matching driver evidence**: retain both
-`settlementStarted` and a `cancelled`, `expired`, or `fail` notification for the
-same attributed auction and solution. Either arrival order is valid, including
-after the live proposal was removed on timeout. Charge 10% of the snapshotted
-`c_l` exactly once through the durable debit protocol. A proposal status or an
-outcome timeout alone cannot authorize a charge. Confirmed success/revert cancels
-an unsigned abandonment operation; signed or landed conflicts require manual
-reconciliation and block another automatic debit. This evidence rests on BYOS's
-internal auction records, an accepted trust assumption.
+**Non-settlement requires matching driver evidence.** Retain `settlementStarted` and a `cancelled`, `expired`, or `fail` notification for the same auction and solution. Charge 10% of the frozen `c_l` once. See [penalty eligibility and corrections](#states). This evidence depends on BYOS's internal records, an accepted trust assumption.
 
 **Infra failures are excluded.** A settlement that reverts because of BYOS's own orchestration — a trampoline missing after a deposit-transaction reorg, for instance — is BYOS's cost. The engine must distinguish "sub-solver route reverted" from "BYOS orchestration failed" before debiting.
 
@@ -818,9 +877,9 @@ When a proposal uses loose slippage (`minBuyAmount < quoteBuyAmount`) and the se
 | `delta == quoteBuyAmount` | No entry | — |
 | `delta > quoteBuyAmount` | `delta − quoteBuyAmount`, converted to native token at the auction's reference price | Negative (over-delivery credit) |
 
-The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-native-token conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The `solutions` table stores the buy token's reference price at `/solve` time so the penalty job can access it later.
+The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-native-token conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The buy token's reference price is frozen at `/solve` selection and retained in `proposals_log` for the penalty job.
 
-**Buffer accounting is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `buffer_entries` table with its signed native-token amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `c_l`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
+**Buffer accounting is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `buffer_entries` table with its signed native-token amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `MIN_COLLATERAL / 5`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
 
 The threshold prevents gas-inefficient micro-debits on small shortfalls and gives over-deliveries a chance to offset shortfalls within the same clearing cycle. A sub-solver that consistently over-delivers accumulates credits that reduce or eliminate future buffer debits. Over-delivery credits offset future shortfalls but are never paid out — they exist solely to avoid penalizing a sub-solver whose net delivery is on target.
 
@@ -860,7 +919,7 @@ The 36h sub-solver window is tight, and sub-solvers without responsive operation
 
 Each solution contains one proposal.
 
-Off-chain, the solution ID is the proposal ID. Attribution is recorded before bidding ([`#proposal-lifecycle`](#proposal-lifecycle)). The Trampoline address in calldata remains the on-chain proof, checked when debiting.
+Off-chain, notifications carry auction and solution ids. The `solutionId` in `/solve` responses is the proposal's own `id`, so attribution is a direct lookup — no join table. `/notify` checks `proposals` first, then `proposals_log` for rows already deleted by a terminal transition. The Trampoline address in calldata remains the on-chain proof, checked when debiting.
 
 ### Gatekeeping
 

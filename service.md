@@ -23,15 +23,15 @@ They never share a socket. A `/solve` response contains the full standing propos
 flowchart LR
     SS[Sub-solver] -->|POST /proposals| PR[Parse + verify signature]
     PR --> EX[Expiry window check]
-    EX --> A{Active auction?}
-    A -->|yes| V[Escrow + simulation\nvalidation]
-    V -->|pass| C[Hold candidate in memory]
-    C --> R200[200 + id]
+    EX --> V[Escrow + simulation validation]
+    V -->|pass| C[Candidate in memory]
+    C --> R200[200 candidate + id]
     V -->|fail| R400[400 rejected + reason]
-    A -->|no| RNO[400 NoActiveAuction]
 ```
 
-The request path parses the proposal, verifies the signature, checks the expiry window, and runs escrow and simulation validation synchronously. A `200` response with `{"id": n}` means the proposal is an in-memory `candidate`. A `400 NoActiveAuction` response before validation means no auction is running and no proposal was stored. If validation cannot complete after an id was allocated, a rejected `AuctionClosed` entry is retained in `proposals_log` and the response is still `400 NoActiveAuction`. A `400 ProposalRejected` response means validation failed with a typed reason in `description`. There is no `202` success or deferred-validation response.
+`POST /proposals` checks the signature, expiry, escrow, order envelope, and simulation before returning. A `200` means the proposal is a candidate. A `400` means it failed validation or the auction is unavailable. Candidates remain in memory until selection; a restart loses them.
+
+Before simulation, require `effectiveBalance >= MIN_COLLATERAL`. After simulation, check exposure against the available collateral. Admission is concurrent and can exceed escrow; see [collateral gates](design-document#collateral-gates-and-deployment-penalty-cap).
 
 For EOA sub-solvers the signature verification is a pure `ecrecover` — no RPC, no state. For contract sub-solvers (`subSolverAddress` present in the POST body) the service tries `ecrecover` first; if that does not match the declared address it falls back to one `eth_call` invoking `isValidSignature` on the contract. See [`#proposal-schema`](#proposal-schema).
 
@@ -41,135 +41,84 @@ For EOA sub-solvers the signature verification is a pure `ecrecover` — no RPC,
 flowchart LR
     D[CoW Driver] -->|POST /solve<br/>auction + gas price| E[Solver engine]
     E --> P[Prefetch escrow balances\nmulticall, all known sub-solvers]
-    P --> F[Fetch active proposals\nby order UIDs]
+    P --> F[Read candidate snapshot]
     F --> S[Score: surplus - gas\nper proposal]
     S --> W[Pick highest per order]
     W --> C[Build settlement\ninteractions]
     C --> R[Return solutions]
 ```
 
-`/solve` is the hot path — **no RPC, no simulation, no writes** beyond recording the solution-to-proposal mapping. It reads from Postgres (indexed by order UID), scores with cached gas estimates, computes CREATE2 addresses locally, and ABI-encodes the two interactions (transfer + execute). Target latency: p99 < 100ms.
+`/solve` scores the candidate snapshot with cached gas estimates and picks one proposal per order. It writes selected proposals to `proposals` and unselected candidates to `proposals_log` before returning. The proposal ID is the solution ID. No route simulation runs on this path. Target latency: p99 < 100ms.
 
 ### Settlement outcomes (internal)
 
-The CoW driver notifies BYOS of outcomes via `POST /notify`. There is no chain watcher and no driver fork.
+Driver cancellations use `settleFailed / DriverCancelled`; mined reverts use `settleFailed / SettlementReverted`. A cancellation requires matching start and abandonment evidence before the non-settlement debit is eligible. Late confirmed outcomes can correct it. Preserve signed or landed debit evidence for reconciliation.
 
-| Notification | Proposal transition |
-|---|---|
-| `settlementStarted` | `submitted` unchanged; retain start evidence. |
-| `success { transaction }` | `submitted`, `lost`, or `DriverCancelled` → `settled`. |
-| `revert { transaction }` | `submitted`, `lost`, or `DriverCancelled` → `settleFailed` / `SettlementReverted`. |
-| `cancelled` | `submitted` or `lost` → `settleFailed` / `DriverCancelled`; no settlement hash implied. |
-| `expired` / `fail` | `submitted` → `lost`; financial eligibility remains evidence-based. |
-
-`DriverCancelled` alone never authorizes an escrow debit. Matching auction/solution
-start and abandonment evidence is required for the existing 10% of snapshotted
-`c_l` charge. Timeout and competitive loss alone do not authorize a penalty.
-Revert debits require `SettlementReverted` (or a legacy null reason), a settlement
-hash, and no conflicting abandonment operation requiring reconciliation. Preserve
-existing penalty hashes on corrections; never substitute a debit hash for a
-settlement/cancellation hash.
-
-`/notify` joins to proposals through the `(auction_id, solution_id, proposal_id)` mapping that `/solve` records synchronously before returning solutions.
+The CoW driver reports outcomes through `POST /notify`. BYOS uses the proposal ID to look up the live row, then the permanent log. See [settlement outcomes](design-document#settlement-outcomes) for notification handling and late corrections.
 
 ## Background workers
 
-Three background loops run alongside the HTTP listeners:
+### Outcome worker
 
-### Outcome observation
-
-Submitted proposals with no observed outcome become `lost`. This is observational
-and never authorizes a penalty. Durable notification evidence survives removal of
-the live row, allowing late cancellations and confirmed chain outcomes to correct
-`proposals_log`.
-
-Validation does not run in a background loop. Escrow and simulation checks run synchronously on the `POST /proposals` request path. See [Proposal ingestion](#proposal-ingestion-public).
+Every `OUTCOME_WORKER_INTERVAL_SECS` (default 60 seconds), check submitted proposals that have waited about two minutes. A recent on-chain `Trade` event gives `Lost/SolverOutbid`; no event gives `Lost/UnknownOutput`. Late driver outcomes can correct either result. A missing outcome alone does not prove that a penalty is due.
 
 ### Penalty loop
 
-Runs on the same interval as validation. Processes Track A debits and post-settlement buffer accounting:
+Processes Track A debits and post-settlement buffer accounting:
 
 1. For each `settleFailed` / `SettlementReverted` proposal (including legacy null reasons with a settlement hash): fetch settlement tx receipt, compute `gas_used × effective_gas_price + frozen c_l`, call `escrow.debit(subSolver, amount, txHash)`.
 2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × frozen c_l, orderUidHash)`.
-3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `solutions` table), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `c_l`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
-4. On debit success: record `penaltyTxHash` while preserving the settlement outcome status. `penalized` is a legacy response status.
+3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `proposals_log` row), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `MIN_COLLATERAL / 5`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
+4. After a Track A debit succeeds, set `proposals_log.penalty_tx_hash`. Keep the proposal status unchanged.
 5. Retry up to 10 times on transient failures, then park for operator investigation.
-
-### Retention sweep
-
-Runs every ~5 minutes. Removes terminal proposals (`Rejected`, `SimFailed`, `Expired`, `Cancelled`) from the active store once they have been in their terminal state for more than 1 hour. Money states (`Settled`, `SettleFailed`, `Penalized`) are never swept — they are dispute evidence.
-
-Swept proposals are not lost: every proposal is mirrored to a permanent `proposals_log` table by a database trigger. `GET /proposal/{id}` falls back to that log automatically, and the list endpoints accept `?includeArchived=true` to query it directly.
 
 ## Proposal lifecycle
 
-The settlement state machine and correction rules are defined in the
-[design document](design-document.md#proposal-lifecycle). A validated proposal
-waits in memory as `candidate`; `/solve` persists the selected proposal as
-`submitted`. Start notifications retain evidence without changing that status.
-Known cancellations and mined reverts both use `settleFailed`, distinguished by
-`DriverCancelled` and `SettlementReverted`. Ordinary losses remain `lost`.
+| State | Location | Cancellable? |
+|---|---|---|
+| `Candidate` | Memory, until selection | Yes |
+| `Submitted` | `proposals`, until an outcome | No |
+| Terminal outcome | `proposals_log` | No |
 
-A confirmed late success/revert may correct a cancellation, preserving penalty
-hashes and reconciliation of signed or landed abandonment operations. Confirmed
-contradictory outcomes cannot be overwritten. Historical rows stay unchanged;
-this correction creates no historical debit or refund.
-
-The TypeScript service validates repeated signed submissions independently; it
-does not deduplicate HTTP requests by `(subSolver, nonce)`. A retry can receive a
-new id. On-chain nonce consumption remains the Trampoline's replay protection.
+Terminal rows leave `proposals` immediately. Reads fall back to `proposals_log`, which retains the outcome. See [the state diagram and transitions](design-document#proposal-lifecycle).
 
 ## Persistence
 
-Postgres is the source of truth:
+| Table | Purpose |
+|---|---|
+| `proposals` | Submitted proposals awaiting an outcome |
+| `proposals_log` | Permanent proposal history, including terminal outcomes and auction prices |
+| `audit_events` | Append-only event history and dispute evidence |
+| `buffer_entries` | Signed delivery gaps; clear net debt above `MIN_COLLATERAL / 5` |
+| `debit_operations` | Durable escrow debit queue; `proposals_log.penalty_tx_hash` records completion |
+| `settlement_attempts`, `settlement_attempt_members`, `settlement_notifications` | Attributed start, abandonment, and chain-outcome evidence |
 
-| Table | Purpose | Retention |
-|---|---|---|
-| `proposals` | Current state — read by `GET`, `/solve`, `/notify`, and the validator | Live proposals indefinite; terminal states swept after 1 hour (except money states) |
-| `audit_events` | Append-only history — what happened, when, why | No deletion path. Dispute evidence for Track B claims arriving up to 3 months later. |
-| `solutions` | Attribution mapping `(auction_id, solution_id) → proposal_id`. Also stores the buy token's reference price from the auction for post-settlement buffer accounting. | Indefinite |
-| `buffer_entries` | Signed ledger of per-proposal buffer amounts for proposals using loose slippage (`minBuyAmount < quoteBuyAmount`). Each entry records the buy token, the gap between `quoteBuyAmount` and the delivered `delta`, converted to native token. Entries accumulate until the balance exceeds `c_l`, then are cleared in batch. Indexed by `(sub_solver, cleared)` and `proposal_id`. | Indefinite |
-| `settlement_attempts`, `settlement_attempt_members`, `settlement_notifications` | Attributed attempts and durable start/abandonment/chain-outcome evidence; eligibility is independent of proposal status | Retained for financial recovery and reconciliation |
-| `debit_operations` | Unique source identities, leases, retries, and signed bytes for escrow debits | Retained for idempotent recovery |
-
-The audit trail uses a write-behind pattern: events are emitted after their proposal write commits, persisted by a dedicated background worker. This decouples audit codec evolution from the store's hot path. The crash window (state change committed, audit event not yet persisted) is accepted at one event per crash.
+Audit events are written by a background worker after the proposal write commits. A crash between those writes can leave a state change without its audit event.
 
 ## Scoring
 
-```
-score = surplus - gas
-```
-
-- **Surplus**: improvement beyond the order's limit price (extra buy tokens on a sell order, sell tokens kept back on a buy order), computed from `quoteBuyAmount` and converted at the auction's reference price.
-- **Gas**: simulated `eth_estimateGas` result + 30k buffer, times the auction's effective gas price.
-
-There is no fee term. CoW's score is `surplus + protocol fees`, and the protocol fee cancels out of ranking. Once the gas cut equals the gas cost, `surplus - gas` matches what the autopilot computes.
-
-BYOS's score is a **pre-ranking** that decides which proposals deserve the driver's encoding budget. The driver re-scores after encoding and simulation.
+`score = surplus - gas`. Calculate surplus from `effectiveBuyAmount = min(simulationBuyAmount, quoteBuyAmount)` and the order's limit, using auction reference prices. Gas is the simulated estimate plus the configured overhead, multiplied by the auction gas price. The driver applies protocol fees and scores the encoded solution again.
 
 ## Gas cut
 
-BYOS keeps the estimated gas cost of each settlement, in the order's sell token, as its revenue. It is declared as the fulfillment's `fee` field — a price wedge, not a deduction from the route.
+Keep the estimated settlement gas cost in sell-token atoms:
 
 ```
-effective_gas = gas_used + 30k buffer
-cut_in_wei = effective_gas × effective_gas_price
-cut_in_sell_tokens = ceil(cut_in_wei × 10^18 / sell_token_price)
+cut_in_wei = (gas_used + gas_overhead) * effective_gas_price
+cut_in_sell_tokens = ceil(cut_in_wei * 10^18 / sell_token_price)
 ```
 
-The cut is **not padded** — a larger cut lowers the score, which lowers CIP-85 consistency rewards. A proposal is skipped if the cut would breach the user's signed limit.
+Return the cut in the fulfillment's `fee` field. Skip a proposal if the cut would exceed the user's signed limit. See [gas accounting](design-document#gas).
 
 ## Key design decisions
 
-Rationale for each decision lives in the ADRs of [byos-service](https://github.com/bleu/byos-service/tree/main/docs/adr) and [byos-service-ts](https://github.com/bleu/byos-service-ts/tree/main/docs/adr). This section summarizes the final state.
-
 ### Sync ingestion
 
-The request path validates proposals synchronously (escrow + simulation). A `200` means an in-memory `candidate`; `400 NoActiveAuction` means the auction is unavailable, including when validation cannot complete after id allocation. In the latter case a rejected `AuctionClosed` log entry is retained. `400 ProposalRejected` means validation failed with a typed reason in `description`. No path returns `202`.
+`POST /proposals` validates once and returns `200` for a candidate or `400` for rejection. The candidate store does not enforce nonce uniqueness or return the original ID on replay. Use a new nonce for each new route; the Trampoline enforces replay protection on-chain.
 
 ### No chain watcher
 
-Settlement outcomes come from the stock CoW driver's `/notify` endpoint, not from scanning blocks. This covers private submissions and dropped transactions that a block scanner would miss. Missed-deadline detection comes free from `Cancelled` and `Expired` notifications.
+The driver supplies settlement outcomes. There is no continuous block scanner. The outcome worker checks recent on-chain trades when a notification is missing. Late notifications can correct the provisional `lost` state.
 
 ### Owner-scoped reads
 
@@ -179,13 +128,13 @@ All `GET` endpoints require an EIP-712 signature, and the recovered signer scope
 
 A proposal that fails simulation once is not re-simulated.
 
-### Profitability gate on first validation only
+### Profitability gate
 
-A score of zero or less rejects as `Unprofitable` on the first simulation, matching `/solve`'s inclusion rule. It is not re-applied on re-validation — gas prices wobble, and rejecting on a spike would churn proposals that are profitable again two blocks later.
+A score of zero or less rejects as `Unprofitable` at validation and selection.
 
 ### Proposal lifetime cap
 
-`validUntil` more than 5 minutes in the future is rejected at ingestion. This bounds worst-case simulation cost per proposal and guarantees the expiry sweep arrives within a known window.
+`validUntil` more than 5 minutes in the future is rejected at ingestion. This limits how long a signed route remains valid.
 
 ### One sub-solver per settlement transaction
 
@@ -193,9 +142,9 @@ The per-sub-solver Trampoline CREATE2 address in the calldata identifies which s
 
 ### Compare-and-swap transitions
 
-All state transitions check the expected current state before updating. Zero rows affected means a concurrent transition won — a cancellation, a notification, or an expiry sweep raced and won. No stale overwrites.
+All state transitions check the expected current state before updating. Zero rows affected means a concurrent transition won — a notification or outcome worker completed first. No stale overwrites.
 
-Penalty caps are frozen with auction attribution before bidding. Revalidation
+Penalty caps are frozen with auction attribution before bidding. Validation
 prices are separate from auction evidence; legacy unsnapshotted events use
 `MIN_COLLATERAL`. Retention preserves unresolved penalty evidence. Buffer clearing
 charges the full net debt only above `MIN_COLLATERAL / 5`; negative credits never
