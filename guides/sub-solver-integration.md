@@ -160,18 +160,9 @@ Poll `GET /proposal/{id}` after acceptance. You can see only your own proposals.
 
 Once the proposal has been selected in an auction, the response includes four price snapshot fields: `sellTokenRefPrice`, `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices`. These are the auction-time prices used to score and settle the proposal. They are absent until the first auction selection and never change afterwards.
 
-A proposal that was not selected at `/solve` time (because another sub-solver won the order, or the auction closed) is written directly to the log with reason `SubsolverOutbid` or `AuctionClosed`. You will see this on `GET /proposal/{id}`.
+Unselected candidates enter the log as `SubsolverOutbid` or `AuctionClosed`. A submitted proposal with no observed driver outcome becomes `lost`: `SolverOutbid` means an on-chain trade was found; `UnknownOutput` means none was found. A late driver outcome can correct `lost`.
 
-A submitted proposal may be marked `lost` by the outcome worker if no driver outcome is observed within the window. This is provisional: a late driver `Success` or `Revert` notification corrects it. The `lost` state carries a sub-reason: `SolverOutbid` (an on-chain Trade event was found for the order — an external solver settled it) or `UnknownOutput` (no Trade event found; the solution was dropped or abandoned).
-
-A `settleFailed` outcome includes a reason:
-
-| Reason | Meaning |
-|---|---|
-| `DriverCancelled` | The driver cancelled submission; this alone does not authorize a penalty. |
-| `SettlementReverted` | The settlement reverted on-chain; the existing Track A policy applies. |
-
-`settlementTxHash` identifies the settlement transaction. `penaltyTxHash` identifies an escrow debit. Late confirmed outcomes can correct a cancellation while preserving existing debit evidence.
+For `settleFailed`, read `rejectionReason`: `DriverCancelled` does not by itself authorize a debit; `SettlementReverted` follows Track A. `settlementTxHash` identifies the settlement and `penaltyTxHash` identifies an escrow debit. Late confirmed outcomes can correct a cancellation and preserve debit evidence.
 
 Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended operating mode.
 
@@ -196,7 +187,7 @@ Send a signed `DELETE` request to cancel a candidate. Once BYOS sends it to the 
 | `SolverOutbid` | None | The submitted proposal was lost to an external solver (on-chain Trade event found). Resubmit or move to the next order. |
 | `Lost/UnknownOutput` | None (provisional) | The outcome worker found no driver outcome within the window and no on-chain trade. May be corrected by a late driver notification. |
 | Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
-| BYOS won but did not settle | Smaller Track A debit | Same dispute window and grounds. |
+| Settlement started, then abandoned | 10% of frozen `c_l`, once | Debit requires matching driver start and abandonment evidence. You have a 72-hour dispute window. |
 <!-- | CoW raised an EBBO or fairness claim | [Track B](../design-document#track-b) passthrough | BYOS freezes your balance and sends you the certificate and evidence. | -->
 
 ### Rate limits: `429` and `503`
@@ -213,7 +204,7 @@ The gate is on submission alone. Reading and cancelling keep working at any bala
 
 ### Simulation failures
 
-Simulation failures do not cost escrow. Only on-chain failures cause escrow debits. If a revert is caused by BYOS's own orchestration (not your route), BYOS pays.
+Simulation failures do not cost escrow. A loss, timeout, or cancellation alone does not authorize a non-settlement debit. BYOS requires matching `settlementStarted` and `cancelled`, `expired`, or `fail` notifications for the same auction and solution. BYOS pays for reverts caused by its own orchestration.
 
 <!-- ### Track B operational readiness
 
