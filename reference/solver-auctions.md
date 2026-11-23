@@ -1,5 +1,8 @@
 # CoW Protocol — Auctions & Solver Competition (reference)
 
+> Historical protocol reference. For current BYOS collateral and penalties, see
+> [the design document](../design-document#collateral-gates-and-deployment-penalty-cap).
+
 > Consolidated from the official docs under <https://docs.cow.fi/cow-protocol/reference/core/auctions>.
 > Captured 2026-06-18 for offline consultation while exploring the BYOS RFP ([BYOS RFP](https://forum.cow.fi/t/rfp-bring-your-own-solver-byos/3469)). For authoritative/current text, follow the source link in each section.
 >

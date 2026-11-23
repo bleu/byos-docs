@@ -67,7 +67,7 @@ Becoming a CoW solver today is a gated process:
 | Onboarding | Shadow competition and testing on Sepolia before mainnet access | Same requirement |
 | Compliance | KYC through the vouching solver's pool | Same |
 
-An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. BYOS drops the barrier to a collateral deposit sized to cover one worst-case revert penalty (`gas + c_l`) and the ability to sign an EIP-712 message and return a route.
+An external router that can find good routes has no way to participate without a bonding pool willing to vouch for it and significant locked capital. To participate in BYOS, a router must deposit collateral, pass the collateral checks, sign an EIP-712 message, and return a route.
 
 ### Responsibility split
 
@@ -431,9 +431,7 @@ struct CancelProposal {
 }
 ```
 
-Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Once the newer proposal validates and becomes a candidate, any earlier candidate for the same `(subSolver, orderUid)` is superseded.
-
-**Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `200 OK` and creates no duplicate. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, so there is no unsigned replacement-intent field.
+Proposals are immutable. Submit a new signed proposal with a new nonce to offer a different route. Candidates can coexist until selection; a new submission does not cancel an earlier one. Nonces prevent replay on-chain; the candidate store does not enforce API idempotency.
 
 **Ingestion is synchronous.** `POST /proposals` validates inline: parse, verify the signature, check the expiry window, then run the escrow check and settlement simulation. For EOA sub-solvers, signature verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. A `200` means the proposal passed and is a candidate. A `400 ProposalRejected` means validation failed with a typed reason.
 
@@ -455,7 +453,7 @@ Stage 1 sits at the edge because a request rejected there costs no socket, no `e
 
 **Two listeners, one process.** A public port serves `/proposals`; a firewalled internal port serves `/solve` and `/notify`. They never share a socket, because their trust boundaries are opposite: the proposal API must be internet-reachable, while a `/solve` response is the full standing proposal book for an auction — amounts, routes, and signatures, all MEV-relevant. Origin is enforced by network topology rather than path obscurity; an optional bearer token on `/solve` is defense in depth, not a replacement. The split also prevents public traffic from starving the latency-critical path.
 
-**Persistence is Postgres, with a live table and a permanent log.** The `proposals` table holds only submitted proposals awaiting outcome — rows are deleted on terminal state. The append-only `proposals_log` receives everything: submitted proposals via trigger, candidates (rejected, cancelled, flushed at auction close) via direct write. The append-only `audit_events` table holds what *happened*, written behind an unbounded channel by a separate task, and is the dispute evidence for Track B claims that arrive up to three months later. Emission is in the store by construction, so a new mutation path cannot forget to leave evidence. The service refuses to start without a reachable database and applied migrations, retries forever during a runtime outage, and drains the queue on shutdown. There is no deletion path for the audit log.
+**Persistence is Postgres, with a live table and a permanent log.** The `proposals` table holds only submitted proposals awaiting outcome — rows are deleted on terminal state. The permanent `proposals_log` records submitted proposals through a database trigger and rejected or unselected proposals through direct writes. Late outcomes can update log rows. The append-only `audit_events` table holds what *happened*, written behind an unbounded channel by a separate task, and is the dispute evidence for Track B claims that arrive up to three months later. Emission is in the store by construction, so a new mutation path cannot forget to leave evidence. The service refuses to start without a reachable database and applied migrations, retries forever during a runtime outage, and drains the queue on shutdown. There is no deletion path for the audit log.
 
 The write-behind leaves a small crash window: an audit event is emitted only after its proposal write commits, so a crash between the two leaves a durable state change with no matching event. Closing it would couple every store write to the audit codec and remove the writer's retry isolation. Accepted, at one event per crash.
 
@@ -510,17 +508,13 @@ Every transition:
 | `Lost` | `Settled` | Late driver `Success` after outcome worker acted. Updates `proposals_log` directly. |
 | `Lost` | `SettleFailed` | Late driver `Revert` after outcome worker acted. Updates `proposals_log` directly. |
 
-**Candidates are not persisted until selected.** A candidate ID is allocated from the Postgres `proposals_id_seq` without inserting a row. The ID is returned to the sub-solver immediately. If byos restarts before the auction, the candidate is lost — the sub-solver can resubmit, and the same auction will likely still be running.
+**Candidates remain in memory until selection.** BYOS allocates an ID before returning acceptance. A restart loses candidates; sub-solvers must resubmit them.
 
-**Non-selected candidates are flushed synchronously at `/solve`.** Before returning a solution to the driver, byos writes every non-selected candidate directly to `proposals_log` with a reason: `SubsolverOutbid` (another sub-solver was selected for the same order) or `AuctionClosed` (the auction ended without selecting this candidate). The flush happens before the response, so state is consistent when the driver receives the solution.
+**Selection records the outcome.** `/solve` inserts selected candidates into `proposals` and writes unselected candidates to `proposals_log` before returning. Unselected candidates receive `SubsolverOutbid` or `AuctionClosed`.
 
-**Competitive losses at auction close.** When `/solve` picks a winner for an order, all other candidates for that order are immediately flushed to `proposals_log` with `SubsolverOutbid`. Sub-solvers distinguish this from on-chain losses (`SolverOutbid`, where the BYOS solution lost to an external solver) and from outcome-worker-detected losses (`Lost`).
-
-**`proposals` table holds only submitted proposals.** A row is inserted when byos sends the solution. Rows are deleted when the proposal reaches a terminal state: `settled`, `settleFailed`, or `lost`. The sync trigger fires on update/insert, preserving the final state in `proposals_log` before deletion. There is no sweep job — the table stays small by construction.
+**Terminal outcomes stay in the log.** A database trigger copies submitted proposals and their final state to `proposals_log` before deletion from `proposals`. `GET /proposal/{id}` checks memory, the live table, then the log.
 
 Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a notification or outcome worker won the race.
-
-**`proposals_log` is the permanent record.** Everything eventually lands here: via trigger for submitted proposals, via direct write for candidates (rejected at validation, flushed at auction close, cancelled). `GET /proposal/{id}` falls back to the log automatically.
 
 ### Rejection reference
 
@@ -540,8 +534,8 @@ Every reason a proposal stops competing, grouped by when it happens:
 
 | Reason | Meaning |
 |---|---|
-| Insufficient escrow | Balance below the threshold (`gas estimate × gas price + minimum collateral`) |
-| Order not found | Order UID not in CoW's orderbook (filled, expired, or cancelled) |
+| Insufficient escrow | Balance below the flat minimum, or post-simulation exposure above available collateral (see collateral gates) |
+| Order not found | Order UID not in the current auction |
 | Unsupported order | Non-ERC20 balance flavors, bridging orders, or partially fillable orders |
 | Amount mismatch | Proposal amounts don't match the order |
 | Proposed slippage outrange | Gap between `minBuyAmount` and `quoteBuyAmount` exceeds the configured bps or native-token cap (sell orders only) |
@@ -598,9 +592,7 @@ A background job runs every `OUTCOME_WORKER_INTERVAL_SECS` (default 60s). It fin
 
 The worker records `lost` in the permanent log and deletes the live row. A late driver outcome can correct this provisional result.
 
-**Attribution:** The driver and outcome worker both use `proposal.id` directly as the `solutionId` in `/solve` responses. There is no `solutions` join table. `/notify` looks up proposals by ID in `proposals` first, then in `proposals_log` (for rows already deleted by the outcome worker or a previous notification).
-
-Notifications carry auction and solution ids. The `solutionId` in `/solve` responses is the proposal's own `id` (allocated at POST /proposals time). `/notify` looks up by that ID, checking `proposals` first and `proposals_log` second (for rows already deleted by a terminal transition). The ids are optional on the wire, so the handler must tolerate notifications it cannot join, but an *outcome* notification that cannot be attributed is an alert-worthy bug.
+**Attribution:** `/solve` uses the proposal ID as `solutionId`. `/notify` checks `proposals` first, then `proposals_log`. Notification IDs are optional on the wire. An outcome that cannot be matched to a proposal requires an operator alert.
 
 The driver knows the transaction hash and whether it reverted, but not what it cost. BYOS makes one `eth_getTransactionReceipt` call on a reverted hash to read the real gas used and gas price. That read is how the debit amount is obtained, not a double-check.
 
@@ -659,9 +651,9 @@ All four signature schemes are supported, since the scheme is encoded in the tra
 
 **The profitability gate runs once, at submission time (inline on `POST /proposals`).** A score of zero or less rejects as unprofitable. Since proposals are validated exactly once, there is no concept of re-validation or re-simulation.
 
-**Proposal lifetime is capped at ingestion.** `validUntil` more than the configured maximum in the future is rejected, which bounds worst-case simulation cost per proposal and guarantees the expiry sweep arrives. Sub-solvers already run polling loops, and a route priced longer ago than that is stale anyway. The order's own `validTo` needs no separate handling: once the order expires or fills, simulation reverts and first-revert-terminal rejects at submission.
+**Proposal lifetime is capped at ingestion.** `validUntil` more than the configured maximum in the future is rejected, which limits how long a signed route remains valid. Sub-solvers already run polling loops, and a route priced longer ago than that is stale anyway. The order's own `validTo` needs no separate handling: once the order expires or fills, simulation reverts and first-revert-terminal rejects at submission.
 
-Simulation runs once, inline at `POST /proposals`. There is no re-simulation tick — proposals are validated exactly once before becoming candidates.
+The driver checks the encoded settlement again before submission.
 
 ### Slippage protection
 
@@ -815,13 +807,53 @@ CoW's own framework has four enforcement layers ([`reference/cow-solver-slashing
 
 Track A and Track B penalties for the same settlement **stack**. There is no crediting of one against the other: if a settlement causes both a revert and an EBBO ruling, the sub-solver pays both, because the proposal caused both problems.
 
-`c_l` is read from CoW's reward mechanism at debit time, with a hardcoded fallback for v1. Current values: **0.010 ETH** on Ethereum, **10 xDAI** on Gnosis.
+`c_l` follows the deployment policy below and is frozen with auction attribution, rather than recomputed at debit time.
 
-**Minimum escrow balance** is sized to cover worst-case Track A for a single settlement, `gas + c_l`.
+**Minimum escrow balance** is a flat floor; the separate cumulative collateral gate covers simulated gas and penalty exposure as described below.
 
 **On shortfall**, BYOS drains the remaining balance and absorbs the difference. The sub-solver is suspended (zero collateral means ineligible). There is no permanent ban and no debt tracking.
 
-The **policy is immutable for v1**. No unilateral updates; a change requires a v2 policy with a new escrow deployment or a migration.
+Deployments adopt this collateral policy through an announced service and database migration. Announce the parameters before accepting proposals. Keep historical charges unchanged. Later policy changes also require an announced migration. The escrow contract remains immutable.
+
+### Collateral gates and deployment penalty cap
+
+The TypeScript service uses a deployment policy inspired by CIP-87:
+
+```
+sellValueNative = floor(sellAmount * sellTokenNativePrice / 10^18)
+c_l = min(floor(sellValueNative * COLLATERAL_RATIO_BPS / 10_000), MIN_COLLATERAL)
+```
+
+`COLLATERAL_RATIO_BPS` defaults to 4 integer basis points. `MIN_COLLATERAL`
+defaults to 10^16 native-token wei and serves as both the minimum escrow floor
+and absolute per-proposal cap. This is a BYOS deployment policy, not an exact
+implementation of CoW's current cap calculation: pair-specific/fractional
+factors, buy-side valuation, and a dynamic USD bound remain deferred.
+
+Gate 1 requires `effectiveBalance >= MIN_COLLATERAL` before simulation. Gate 2
+runs after simulation and requires:
+
+```
+currentExposure + sum(submitted sibling exposures)
+    <= effectiveBalance - max(outstandingBufferBalance, 0)
+exposure = c_l + simulatedGas * gasPrice
+```
+
+Equality passes. Count the current candidate once, using its simulated gas.
+Include submitted proposals for the same sub-solver. Other in-memory candidates
+are excluded. If a submitted proposal has no gas estimate, reserve 200,000 gas;
+if it has no price, reserve the absolute cap. Negative buffer credits offset
+shortfalls but cannot cover gas or penalties.
+
+Admission has no per-sub-solver lock. Concurrent validations can accept more
+exposure than escrow can cover. BYOS accepts this shortfall risk. Gate 2 runs
+after simulation, so a rejection still consumes simulation work.
+
+Store each solution's cap with its auction attribution before returning the bid.
+Revert and non-settlement charges use this frozen cap. Later prices and auctions
+do not change the charge. Keep validation prices separate from auction evidence.
+Use the absolute cap for legacy rows without a cap snapshot. Retain unresolved
+penalty evidence, including signed debits that await recovery.
 
 ### Track A
 
@@ -850,9 +882,9 @@ When a proposal uses loose slippage (`minBuyAmount < quoteBuyAmount`) and the se
 | `delta == quoteBuyAmount` | No entry | — |
 | `delta > quoteBuyAmount` | `delta − quoteBuyAmount`, converted to native token at the auction's reference price | Negative (over-delivery credit) |
 
-The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-native-token conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The buy token's reference price is stored on the `proposals_log` row at settle time so the penalty job can access it later.
+The `delta` value is read from the `Executed` event emitted by the Trampoline in the settlement transaction receipt. The buy-token-to-native-token conversion uses the auction's reference price — the same price basis CoW uses to evaluate BYOS's solution quality. The buy token's reference price is frozen at `/solve` selection and retained in `proposals_log` for the penalty job.
 
-**Buffer accounting is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `buffer_entries` table with its signed native-token amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `c_l`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
+**Buffer accounting is ledger-based with threshold clearing.** Individual entries are not debited immediately. Instead, each entry is recorded in a `buffer_entries` table with its signed native-token amount. The outstanding balance for a sub-solver is the sum of all uncleared entries — positive entries (shortfalls) and negative entries (over-deliveries) naturally offset each other. When the outstanding balance exceeds `MIN_COLLATERAL / 5`, BYOS debits the full balance from escrow in a single transaction and marks all entries as cleared.
 
 The threshold prevents gas-inefficient micro-debits on small shortfalls and gives over-deliveries a chance to offset shortfalls within the same clearing cycle. A sub-solver that consistently over-delivers accumulates credits that reduce or eliminate future buffer debits. Over-delivery credits offset future shortfalls but are never paid out — they exist solely to avoid penalizing a sub-solver whose net delivery is on target.
 
