@@ -118,49 +118,31 @@ Recover remaining tokens with `claimToken`. The signature commits to both calls.
 
 ## 6. Sign the proposal
 
-Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). The `ProposalData` struct has nine fields: `orderUidHash`, `sellToken`, `buyToken`, `sellAmount`, `minBuyAmount`, `quoteBuyAmount`, `interactionsHash`, `validUntil`, `nonce`. Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
+Use `byosDomain` and `signProposal` from `packages/common`, or implement the [proposal schema](../design-document#proposal-schema). The domain uses your chain ID and TrampolineFactory address. Update both when the deployment changes. Verify hashes against the deployment contract's test vectors.
 
-The API verifies your signature at submission. The Trampoline verifies the same signature on-chain at settlement. If the two do not match, the settlement fails.
-
-### Domain binding
-
-The EIP-712 domain binds to the TrampolineFactory address. The domain is specific to a chain **and** a deployment generation. A contracts v2 deployment invalidates all outstanding signatures. Update your domain configuration when contracts change.
-
-### Route commitment
-
-The `interactionsHash` field in the signed struct commits to your route. BYOS cannot substitute different interactions. A third party can verify that the signed data matches the settlement calldata. This property makes Track A debits verifiable.
-
-### Expiry
-
-Keep `validUntil` short. BYOS caps it at ingestion ([`#proposal-lifecycle`](../design-document#proposal-lifecycle)). A route that is more than a few minutes old is stale.
+Sign all nine `ProposalData` fields: `orderUidHash`, `sellToken`, `buyToken`, `sellAmount`, `minBuyAmount`, `quoteBuyAmount`, `interactionsHash`, `validUntil`, and `nonce`. `interactionsHash` commits to the exact route. Use a new nonce for each new proposal, and keep `validUntil` within the deployment limit.
 
 ## 7. Submit and poll
 
-Send a `POST` request with the proposal. See the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for the payload format, status codes, and rejection reasons.
+Use the public BYOS endpoint (default port 9585). See [OpenAPI](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for JSON fields and error responses.
 
-### API endpoints
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/proposals` | Submit a signed proposal. `200 {"id": n}` means validation passed and the candidate is in memory. |
+| `GET` | `/proposal/{id}` | Read your candidate, submitted proposal, or permanent log entry. |
+| `GET` | `/proposals/{order_uid}` | List your in-flight proposals for an order. |
+| `GET` | `/proposals/by-sub-solver` | List all your in-flight proposals. |
+| `GET` | `/buffer-balance` | Read your buffer balance and entries. Divide the current `threshold` field by five for the clearing threshold. |
+| `DELETE` | `/proposal/{id}` | Cancel your candidate. Returns `409 AlreadySubmitted` after submission to the driver. |
+| `GET` | `/openapi.yaml` | Read the API schema. No authentication required. |
 
-All endpoints are on the public listener (default port 9585):
-
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a proposal. Returns `200 {"id": n}` for a candidate; errors include `400 ProposalRejected`, `400 NoActiveAuction`, and `400 UnknownOrder`. See the response rules below. |
-| `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
-| `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
-| `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
-| `GET` | `/openapi.yaml` | None | Machine-readable OpenAPI 3 spec for the full API. Use this to generate a client or validate your integration. |
-| `GET` | `/buffer-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding buffer balance and entries. The current `threshold` field is five times the clearing threshold. |
-| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Candidate` proposals (in-memory, not yet submitted). Returns `409 AlreadySubmitted` if the proposal has already been sent to the driver. |
+For proposal lists, use `?includeArchived=true` to query the permanent log instead.
 
 ### Read authentication
 
-Sign an EIP-712 `ReadAuth { version: 1 }` message once. Send it in the `X-Signature` header with every `GET` request. This signature has no timestamp or nonce. If it leaks, the risk is limited to read access to your own proposals. The signature does not grant write or cancellation access.
+Sign `ReadAuth { version: 1 }` once with the proposal domain. Send it in `X-Signature` for authenticated reads. This signature grants read access only. A proposal owned by another address returns `404`.
 
-If you query a proposal that is not yours, you get `404` (not `403`). You cannot check if a proposal id exists.
-
-### The response to POST is acceptance
-
-A `200 {"id": n}` response means the proposal passed validation and is a candidate in memory. For `400 ProposalRejected`, read the reason in `description`. For `400 NoActiveAuction`, wait for the next auction and resubmit. If the auction closes after ID allocation, BYOS keeps a rejected `AuctionClosed` log entry. Repeated signed requests can receive new IDs.
+For `DELETE`, sign `CancelProposal { proposalId }` with the same domain and send it in `X-Signature`. Use `signReadAuth` and `signCancellation` from `packages/common`.
 
 ### Poll for status
 
@@ -174,9 +156,7 @@ For `settleFailed`, read `rejectionReason`: `DriverCancelled` does not by itself
 
 Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended operating mode.
 
-### Cancel a proposal
-
-Send a signed `DELETE` request to cancel a candidate. Once BYOS sends it to the driver, cancellation returns `409 AlreadySubmitted`. To offer a new route, submit a new proposal with a new nonce. The earlier candidate remains until you cancel it or selection ends.
+To replace a route, cancel the earlier candidate and submit a new proposal with a new nonce. A new submission does not cancel an earlier candidate.
 
 ## 8. Error handling
 
@@ -200,15 +180,11 @@ Send a signed `DELETE` request to cancel a candidate. Once BYOS sends it to the 
 
 ### Rate limits: `429` and `503`
 
-Your requests share one budget across `POST`, `GET` and `DELETE`, scaled by your escrow balance. A larger deposit buys more throughput. Size your polling against the budget: polling every live proposal on a short interval is what consumes it, and writes are cheap by comparison.
+`POST`, `GET`, and `DELETE` share an escrow-based budget. Reserve capacity for status reads; use `GET /proposals/by-sub-solver` to synchronize multiple proposals in one request.
 
-A `429` means you exceeded that budget, or the per-IP limit in front of it. A `503` means a store BYOS depends on is unreachable — infrastructure, not load. The two are deliberately separate so you can tell them apart in your own logs.
+On `429` or `503`, stop requests until `Retry-After` seconds have passed, then retry. `429` means the signer or IP budget is exhausted; `503` means a dependency is unavailable. The current Fynd and Binance clients defer later cycles on `429`, but can continue the current submission batch. They do not handle `503` retry headers. Your client must handle both.
 
-Both carry a `Retry-After` header, in seconds. Honour it. The reference clients do not, and that is a limitation of the examples rather than a pattern to copy: a client that retries at full rate through a `429` gets nothing back sooner and keeps its own counter pinned.
-
-A `403` with `InsufficientEscrow` on submission means BYOS has a cached balance for your address that is below the minimum collateral. Deposit more; the gate clears within one refresh interval. An address BYOS has not seen before is not rejected — it is admitted at the lowest rate tier.
-
-The gate is on submission alone. Reading and cancelling keep working at any balance, deliberately: requesting a withdrawal drops your effective balance to zero, and you still need to cancel and watch whatever you have live while it winds down.
+On `403 InsufficientEscrow`, deposit more collateral and allow one balance refresh interval. Reads and cancellations remain available during withdrawal and at low balances. An unknown address enters at the lowest rate tier; validation still checks its collateral.
 
 ### Simulation failures
 
@@ -224,14 +200,17 @@ Every penalty action emits an on-chain Escrow event. You can use these events to
 
 ## 9. Reference implementations
 
-| Language | Location |
-|---|---|
-| **Rust** | [`crates/subsolver`](https://github.com/bleu/byos-service/tree/main/crates/subsolver) in `byos-service` |
-| **TypeScript** | [`apps/subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/subsolver) in `byos-service-ts` |
-| **TypeScript** | [`apps/fynd-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/fynd-subsolver) in `byos-service-ts` |
-| **TypeScript** | [`apps/private-mm-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/private-mm-subsolver) in `byos-service-ts` |
+Use the TypeScript examples in [`byos-service-ts`](https://github.com/bleu/byos-service-ts):
 
-The protocol is language-neutral. Use either example for the sequence, the EIP-712 construction, and the polling behavior. The [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) specifies all wire-level details.
+| Component | Use |
+|---|---|
+| [`apps/fynd-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/fynd-subsolver) | Fynd routing on BNB Chain |
+| [`apps/binance-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/binance-subsolver) | Binance routing and both discovery methods |
+| [`packages/subsolver-core`](https://github.com/bleu/byos-service-ts/tree/main/packages/subsolver-core) | Proposal signing, API client, discovery, and request budget |
+| [`apps/baseline-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/baseline-subsolver) | Baseline client and end-to-end test example |
+| [`apps/private-mm-subsolver`](https://github.com/bleu/byos-service-ts/tree/main/apps/private-mm-subsolver) | Inventory-based routes |
+
+Fynd and Binance currently submit sell orders only. Use the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for request and response formats.
 
 ## Pre-launch checklist
 
