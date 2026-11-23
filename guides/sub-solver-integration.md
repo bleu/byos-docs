@@ -95,6 +95,12 @@ BYOS transfers the signed `sellAmount` to your Trampoline before execution. Your
 
 Your instance cannot use settlement funds or other instances. Remaining tokens stay in your instance. Recover them with `claimToken`, and manage any approvals that can spend them.
 
+### Native tokens and order hooks
+
+Use the auction's token addresses in your proposal. For a native buy, quote the wrapped native token at the provider and deliver it to settlement; keep the auction's `buyToken` in the signed proposal. BYOS restores the user's signed order for simulation, and the driver handles native payout. Do not add a second unwrap.
+
+Do not add the order's own pre/post hooks to your route. BYOS includes them in simulation; the driver includes them at settlement. Orders with `flashloanHint` use BYOS's flash-loan router. Reject general Atomic Bundle orders with `wrappers`, and orders with non-ERC20 balance sources or destinations; BYOS rejects them as `UnsupportedOrder`.
+
 ### Headroom
 
 Leave headroom above the user's limit price. BYOS takes a [gas cut](../design-document#gas) from the trade. The CoW driver applies protocol and partner fees on top. If a route quotes exactly at the limit, BYOS skips it because the solution is not feasible.
