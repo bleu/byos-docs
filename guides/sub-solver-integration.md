@@ -166,7 +166,7 @@ If you query a proposal that is not yours, you get `404` (not `403`). You cannot
 
 ### The POST response is the verdict
 
-BYOS validates proposals synchronously on the request path. A `200` response with `{"id": n}` means the proposal passed escrow and simulation checks and is held in memory as a `candidate`. A `400 ProposalRejected` response means validation failed — read the typed reason in `description` and fix the route or amounts. A `400 NoActiveAuction` response means the auction is unavailable. Before id allocation nothing is stored; after id allocation, if validation cannot complete, a rejected `AuctionClosed` log entry is retained. Resubmit when the next auction opens. There is no deferred `202` response. A repeated signed request is independently validated and can receive a new id.
+A `200 {"id": n}` response means the proposal passed validation and is a candidate in memory. For `400 ProposalRejected`, read the reason in `description`. For `400 NoActiveAuction`, wait for the next auction and resubmit. If the auction closes after ID allocation, BYOS keeps a rejected `AuctionClosed` log entry. Repeated signed requests can receive new IDs.
 
 ### Poll for state changes
 

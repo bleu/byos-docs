@@ -22,7 +22,7 @@ These anchors are the interface between this document and every ADR that cites i
 | [`#proposal-api`](#proposal-api) | HTTP surface, authentication, rate limiting |
 | [`#proposal-lifecycle`](#proposal-lifecycle) | State machine, simulation, retention |
 | [`#solver-engine`](#solver-engine) | Selection, scoring, settlement crafting |
-| [`#single-order-solutions`](#single-order-solutions) | One order per proposal; same-sub-solver settlement batches |
+| [`#single-order-solutions`](#single-order-solutions) | One order per proposal and solution |
 | [`#gas`](#gas) | The gas cut and how CoW fees actually work |
 | [`#penalties`](#penalties) | The penalty schedule as a whole |
 | [`#track-a`](#track-a) | Revert, deadline, and non-settlement debits |
@@ -473,7 +473,6 @@ stateDiagram-v2
     [*] --> Candidate: validation passes
     Candidate --> Submitted: selected by /solve
     Candidate --> Cancelled: DELETE or auction closes
-    Candidate --> Expired: validUntil passed
     Submitted --> Settled: driver success with transaction
     Submitted --> SettleFailed: driver revert or cancelled
     Submitted --> Lost: expired, fail, or outcome timeout
@@ -481,7 +480,6 @@ stateDiagram-v2
     Lost --> SettleFailed: late revert or cancelled
     SettleFailed --> Settled: DriverCancelled corrected by confirmed success
     SettleFailed --> SettleFailed: DriverCancelled corrected by confirmed revert
-    SettleFailed --> SettleFailed: revert debit lands; record penaltyTxHash
 ```
 
 All states except `candidate` and `submitted` are terminal for bidding. Owner reads
@@ -504,30 +502,13 @@ it cannot overwrite a confirmed contradictory chain outcome.
 
 `penalized` is a legacy response status. Current debit writers preserve the settlement outcome status and record the escrow debit in `penaltyTxHash`.
 
-**Status is not financial evidence.** `DriverCancelled` does not prove a
-cancellation transaction was broadcast or mined. The driver supplies no
-cancellation hash; do not invent one or substitute the escrow debit hash.
-`settlementTxHash` records a confirmed success/revert transaction, while
-`penaltyTxHash` records an escrow debit.
+**Penalty eligibility requires evidence.** `settlementTxHash` identifies a confirmed settlement transaction. `penaltyTxHash` identifies an escrow debit. A driver cancellation supplies no cancellation transaction hash.
 
-A cancellation alone never authorizes a debit. Matching auction/solution start
-and abandonment evidence is required, in either arrival order, for the existing
-non-settlement charge of 10% of snapshotted `c_l`. Timeout-only and ordinary
-competitive losses do not authorize charges. The revert worker selects
-`SettlementReverted` rows, with compatibility for legacy `settleFailed` rows
-whose reason is null; it must never charge `DriverCancelled` as gas + `c_l`.
+Charge non-settlement only when durable start and abandonment notifications match the same auction and solution. Either arrival order is valid. The charge is 10% of the frozen `c_l`. A timeout or competitive loss alone is not chargeable. Revert debits require `SettlementReverted`, or a legacy null reason with a settlement hash. Never apply the revert debit to `DriverCancelled`.
 
-A late confirmed outcome cancels an unsigned abandonment charge. If abandonment
-transaction bytes were already signed or its debit landed, preserve that evidence
-and require manual reconciliation; do not create a second charge or an automatic
-refund. Existing penalty hashes survive corrections. Duplicate and out-of-order
-notifications are idempotent. Historical rows are not automatically reclassified
-or used to initiate new financial actions.
+A late confirmed outcome cancels an unsigned abandonment debit. If the debit is already signed or landed, preserve its evidence and require manual reconciliation. Do not issue a second debit or an automatic refund. Keep existing penalty hashes through corrections. Duplicate notifications have no extra effect; historical rows remain unchanged.
 
-Transitions serialize on the committed row and only apply from eligible states.
-Selected proposals survive auction closure, while unselected candidates stop
-competing. A success also cancels the same sub-solver's remaining live proposals
-for the order.
+Selected proposals survive auction closure. A success cancels the same sub-solver's remaining live proposals for the order.
 
 ### Rejection reference
 
@@ -676,11 +657,7 @@ BYOS is the **solver engine** half of a standard CoW driver and solver pair. The
 
 ### Single-order solutions
 
-**One proposal commits to one order.** After choosing at most one winning proposal for each order UID, BYOS combines proposals from the same sub-solver into a solution when their clearing-price vectors are compatible by exact integer scaling. Incompatible prices remain separate candidate solutions. Batch proposals and cross-sub-solver settlements are out of scope.
-
-Each batch preserves its members' trades, gas cuts, hooks, and transfer/Trampoline interaction pairs. Its gas estimate is the sum of the members' estimates. This allows the driver to submit multiple orders through one winning solution without enabling driver-side merging across sub-solvers. Proposal signatures and the EIP-712 schema remain unchanged.
-
-Every solution ID maps to all of its proposal IDs. Outcomes apply to every member. A reverted settlement incurs one transaction-cost-plus-`c_l` debit against its sub-solver; an abandoned solution records one non-settlement penalty. Successful delivery accounting remains per proposal, using each order's `Executed` event.
+Each proposal and solution contains one order from one sub-solver. `/solve` selects at most one proposal per order. The solution ID is the proposal ID; outcomes apply to that proposal. Driver-side solution merging is disabled.
 
 ### Scoring
 
@@ -881,9 +858,9 @@ The 36h sub-solver window is tight, and sub-solvers without responsive operation
 
 **One sub-solver per settlement transaction.** The per-sub-solver Trampoline CREATE2 address in the settlement calldata self-evidences which sub-solver's route ran, with no reliance on BYOS's private records. That is what makes Track A debits indisputable and Track B attribution clean.
 
-Batching is limited to proposals from that sub-solver.
+Each solution contains one proposal.
 
-Off-chain, notifications carry auction and solution ids rather than proposals, so attribution to a proposal is a join through the `solutions` mapping the engine writes before bidding ([`#proposal-lifecycle`](#proposal-lifecycle)). The Trampoline address in calldata remains the on-chain proof, checked when debiting.
+Off-chain, the solution ID is the proposal ID. Attribution is recorded before bidding ([`#proposal-lifecycle`](#proposal-lifecycle)). The Trampoline address in calldata remains the on-chain proof, checked when debiting.
 
 ### Gatekeeping
 
