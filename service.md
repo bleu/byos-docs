@@ -80,11 +80,42 @@ Processes Track A debits and post-settlement buffer accounting:
 
 Terminal rows leave `proposals` immediately. Reads fall back to `proposals_log`, which retains the outcome. See [the state diagram and transitions](design-document#proposal-lifecycle).
 
+## Persistence
+
+| Table | Purpose |
+|---|---|
+| `proposals` | Submitted proposals awaiting an outcome |
+| `proposals_log` | Permanent proposal history, including terminal outcomes and auction prices |
+| `audit_events` | Append-only event history and dispute evidence |
+| `buffer_entries` | Signed delivery gaps; clear net debt above `MIN_COLLATERAL / 5` |
+| `penalties` | Pending non-settlement debits |
+
+Audit events are written by a background worker after the proposal write commits. A crash between those writes can leave a state change without its audit event.
+
+## Scoring
+
+`score = surplus - gas`. Calculate surplus from `effectiveBuyAmount = min(simulationBuyAmount, quoteBuyAmount)` and the order's limit, using auction reference prices. Gas is the simulated estimate plus the configured overhead, multiplied by the auction gas price. The driver applies protocol fees and scores the encoded solution again.
+
+## Gas cut
+
+Keep the estimated settlement gas cost in sell-token atoms:
+
+```
+cut_in_wei = (gas_used + gas_overhead) * effective_gas_price
+cut_in_sell_tokens = ceil(cut_in_wei * 10^18 / sell_token_price)
+```
+
+Return the cut in the fulfillment's `fee` field. Skip a proposal if the cut would exceed the user's signed limit. See [gas accounting](design-document#gas).
+
+## Key design decisions
+
+### Sync ingestion
+
 `POST /proposals` validates once and returns `200` for a candidate or `400` for rejection. The candidate store does not enforce nonce uniqueness or return the original ID on replay. Use a new nonce for each new route; the Trampoline enforces replay protection on-chain.
 
-### Outcome recovery
+### No chain watcher
 
-The driver supplies settlement outcomes. The outcome worker checks recent on-chain trades when a notification is missing. Late notifications can correct the provisional `lost` state.
+The driver supplies settlement outcomes. There is no continuous block scanner. The outcome worker checks recent on-chain trades when a notification is missing. Late notifications can correct the provisional `lost` state.
 
 ### Owner-scoped reads
 
