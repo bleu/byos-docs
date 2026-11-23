@@ -69,7 +69,15 @@ BYOS does not operate an orderbook. Orders come from CoW's orderbook API. Access
 
 One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format. Both fill-or-kill and partially fillable orders are supported. For partially fillable orders, your proposal's `sellAmount` can be any amount up to the order's remaining fillable amount, and both `minBuyAmount` and `quoteBuyAmount` must independently satisfy the proportionally scaled limit price.
 
-## 4. Build a route
+## 4. Auction timing
+
+Orders appear in CoW's orderbook only after BYOS receives them from the driver in `/solve`. Do not poll the orderbook before a `/solve` call has arrived — the orders will not be there yet.
+
+A candidate is valid for one auction window only. Unselected candidates stop competing when the window closes; selected candidates become durable `submitted` proposals and remain available for driver outcomes. New `POST /proposals` requests after the window closes receive `400 NoActiveAuction` until the next auction arrives.
+
+If an order was not filled in the current auction, submit a new proposal when the next auction opens.
+
+## 5. Build a route
 
 A route is a list of raw calls. Each call has a target, a value, and calldata. You can use any DEX or protocol. BYOS does not maintain a venue registry. The calls execute as-is inside your Trampoline instance.
 
@@ -106,7 +114,7 @@ If your route does not explicitly forward sell tokens before the sweep, you can 
 
 **Not recommended but not prevented:** you may deposit tokens directly into your Trampoline instance and trust BYOS to always include the funding transfer. BYOS has no incentive to omit it, but the trust assumption is stronger than necessary.
 
-## 5. Sign the proposal
+## 6. Sign the proposal
 
 Sign the EIP-712 typed data described in [`#proposal-schema`](../design-document#proposal-schema). The `ProposalData` struct has nine fields: `orderUidHash`, `sellToken`, `buyToken`, `sellAmount`, `minBuyAmount`, `quoteBuyAmount`, `interactionsHash`, `validUntil`, `nonce`. Get the struct, domain, and typehash from [`bleu/byos-contracts`](https://github.com/bleu/byos-contracts). Test your signatures against the contract's own test vectors. Do not derive the typehash yourself.
 
@@ -124,7 +132,15 @@ The `interactionsHash` field in the signed struct commits to your route. BYOS ca
 
 Keep `validUntil` short. BYOS caps it at ingestion ([`#proposal-lifecycle`](../design-document#proposal-lifecycle)). A route that is more than a few minutes old is stale.
 
-## 6. Submit and poll
+### Contract signers (EIP-1271)
+
+If your sub-solver is a smart contract, set `subSolverAddress` in the POST body to your contract's address. The service tries ECDSA first; if that does not match, it calls `isValidSignature` on your contract. `subSolverAddress` is your identity: it is the escrow key and the Trampoline CREATE2 salt. It must match the address that holds collateral in the Escrow.
+
+The signature is not limited to 65 bytes. The Trampoline uses `SignatureChecker` on-chain, so service and contract apply identical verification.
+
+If your contract is upgradeable or has a mutable owner, dispute attribution may not hold after the fact. Use a non-upgradeable signer if dispute resolution matters.
+
+## 7. Submit and poll
 
 Send a `POST` request with the proposal. See the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) for the payload format, status codes, and rejection reasons.
 
@@ -134,13 +150,13 @@ All endpoints are on the public listener (default port 9585):
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `POST` | `/proposals` | Proposal signature (in body) | Submit a signed proposal. Returns `202` with an id. Replaying identical signed content returns the original id; reusing its nonce with different signed content returns `409 NonceAlreadyUsed`. This is **not** acceptance. |
+| `POST` | `/proposals` | Proposal signature (in body) | Submit a proposal. Returns `200 {"id": n}` for a candidate; errors include `400 ProposalRejected`, `400 NoActiveAuction`, and `400 UnknownOrder`. See the response rules below. |
 | `GET` | `/proposal/{id}` | `X-Signature` (EIP-712 `ReadAuth`) | Get your proposal status, rejection reason, and settlement/penalty tx hashes. Automatically falls back to the permanent log if the proposal has been swept from the active store — so this works regardless of how old the proposal is. |
 | `GET` | `/proposals/{order_uid}` | `X-Signature` | List your proposals on one order. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead, which includes all statuses and swept proposals. |
 | `GET` | `/proposals/by-sub-solver` | `X-Signature` | List all your proposals. Returns only in-flight proposals by default. Pass `?includeArchived=true` to fetch from the permanent log instead. |
 | `GET` | `/openapi.yaml` | None | Machine-readable OpenAPI 3 spec for the full API. Use this to generate a client or validate your integration. |
 | `GET` | `/buffer-balance` | `X-Signature` (EIP-712 `ReadAuth`) | Your outstanding buffer balance, the clearing threshold, and individual per-proposal entries. |
-| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Submitted` or `Active` proposals. |
+| `DELETE` | `/proposal/{id}` | `X-Signature` (EIP-712 `CancelProposal`) | Cancel a proposal. Works only on `Candidate` proposals (in-memory, not yet submitted). Returns `409 AlreadySubmitted` if the proposal has already been sent to the driver. |
 
 ### Read authentication
 
@@ -148,44 +164,58 @@ Sign an EIP-712 `ReadAuth { version: 1 }` message once. Send it in the `X-Signat
 
 If you query a proposal that is not yours, you get `404` (not `403`). You cannot check if a proposal id exists.
 
-### The response to POST is not acceptance
+### The response to POST is acceptance
 
-A `2xx` response means "accepted for validation". BYOS stores the proposal as `Submitted` and returns an id. Escrow checks and simulation run in a background loop ([`#proposal-api`](../design-document#proposal-api)). Do not treat a `2xx` as "my proposal is live".
+A `200 {"id": n}` response means the proposal passed validation and is a candidate in memory. For `400 ProposalRejected`, read the reason in `description`. For `400 NoActiveAuction`, wait for the next auction and resubmit. If the auction closes after ID allocation, BYOS keeps a rejected `AuctionClosed` log entry. Repeated signed requests can receive new IDs.
 
-### Poll for the verdict
+### Poll for status
 
-After you submit, poll for the verdict with `GET /proposal/{id}`. You can see only your own proposals. Expect a verdict within approximately one block. The validator tick interval determines the latency, not the request round-trip. See [SLO targets](../operations/slo-targets).
-
-Continue to poll after the first verdict. A live proposal is re-simulated every tick. It can fail at any time because chain state changed.
+Poll `GET /proposal/{id}` after acceptance. You can see only your own proposals. See [SLO targets](../operations/slo-targets).
 
 Once the proposal has been selected in an auction, the response includes four price snapshot fields: `sellTokenRefPrice`, `surplusTokenRefPrice`, `auctionGasPrice`, and `clearingPrices`. These are the auction-time prices used to score and settle the proposal. They are absent until the first auction selection and never change afterwards.
+
+A proposal that was not selected at `/solve` time (because another sub-solver won the order, or the auction closed) is written directly to the log with reason `SubsolverOutbid` or `AuctionClosed`. You will see this on `GET /proposal/{id}`.
+
+A submitted proposal may be marked `lost` by the outcome worker if no driver outcome is observed within the window. This is provisional: a late driver `Success` or `Revert` notification corrects it. The `lost` state carries a sub-reason: `SolverOutbid` (an on-chain Trade event was found for the order — an external solver settled it) or `UnknownOutput` (no Trade event found; the solution was dropped or abandoned).
+
+A `settleFailed` outcome includes a reason:
+
+| Reason | Meaning |
+|---|---|
+| `DriverCancelled` | The driver cancelled submission; this alone does not authorize a penalty. |
+| `SettlementReverted` | The settlement reverted on-chain; the existing Track A policy applies. |
+
+`settlementTxHash` identifies the settlement transaction. `penaltyTxHash` identifies an escrow debit. Late confirmed outcomes can correct a cancellation while preserving existing debit evidence.
 
 Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended operating mode.
 
 ### Cancel a proposal
 
-To cancel a proposal before it settles, send a signed `DELETE` request. Proposals are immutable and there is no update operation. To replace one, submit a new proposal with a new nonce: when it validates, BYOS cancels your older submitted or active proposals for that order. Do not cancel first; the old proposal remains usable until the replacement becomes active.
+Send a signed `DELETE` request to cancel a candidate. Once BYOS sends it to the driver, cancellation returns `409 AlreadySubmitted`. To offer a new route, submit a new proposal with a new nonce. The earlier candidate remains until you cancel it or selection ends.
 
-## 7. Error handling
+## 8. Error handling
 
 | What happened | Cost | Action |
 |---|---|---|
 | Rejected at gatekeeping | None | Read the typed rejection reason. Fix the route or the amounts. |
+| `400 NoActiveAuction` | None | No `/solve` has arrived yet. BYOS just started or is between auctions. Wait for the next auction and resubmit. |
+| `400 UnknownOrder` | None | The order UID is not in the current auction. The order may not have reached BYOS yet. Wait for the next auction. |
 | Simulation reverted | None (one rate-limit slot used) | The proposal is dropped on the first revert. There are no retries. Resubmit if the route is still valid. |
 | `429` rate limited | None | You are over your budget. Wait out `Retry-After`. Deposit more escrow for a larger budget. |
 | `503` service unavailable | None | A BYOS dependency is down. Wait out `Retry-After` and retry; nothing was lost. |
-| `409 NonceAlreadyUsed` | None | The nonce was already used for different signed content. Generate a new nonce; retrying the exact same signed proposal is safe and returns its original id. |
 | `403` insufficient escrow | None | Your cached balance is below the minimum collateral. Deposit more. Submission only — reads and cancellations keep working. |
 | Expired | None | Your `validUntil` passed. Use a shorter interval. |
-| `SubsolverOutbid` | None | BYOS selected a different sub-solver for this order. Resubmit with a better route for the next auction. |
-| `SolverOutbid` | None | BYOS won the internal competition but an external solver settled the order first. Resubmit or move to the next order. |
+| `SubsolverOutbid` | None | BYOS selected a different sub-solver for this order at `/solve` time. Resubmit with a better route for the next auction. |
+| `AuctionClosed` | None | The auction ended without selecting this candidate. Resubmit for the next auction. |
+| `SolverOutbid` | None | The submitted proposal was lost to an external solver (on-chain Trade event found). Resubmit or move to the next order. |
+| `Lost/UnknownOutput` | None (provisional) | The outcome worker found no driver outcome within the window and no on-chain trade. May be corrected by a late driver notification. |
 | Settlement reverted on-chain | [Track A](../design-document#track-a) debit | BYOS debits your escrow immediately. You have a 72-hour dispute window. |
 | BYOS won but did not settle | Smaller Track A debit | Same dispute window and grounds. |
 <!-- | CoW raised an EBBO or fairness claim | [Track B](../design-document#track-b) passthrough | BYOS freezes your balance and sends you the certificate and evidence. | -->
 
 ### Rate limits: `429` and `503`
 
-Your requests share one budget across `POST`, `GET` and `DELETE`, scaled by your escrow balance. A larger deposit buys more throughput. Size your polling against the budget, not against the tick interval: polling every live proposal on a short tick is what consumes it, and writes are cheap by comparison.
+Your requests share one budget across `POST`, `GET` and `DELETE`, scaled by your escrow balance. A larger deposit buys more throughput. Size your polling against the budget: polling every live proposal on a short interval is what consumes it, and writes are cheap by comparison.
 
 A `429` means you exceeded that budget, or the per-IP limit in front of it. A `503` means a store BYOS depends on is unreachable — infrastructure, not load. The two are deliberately separate so you can tell them apart in your own logs.
 
@@ -207,7 +237,7 @@ If you cannot respond to evidence requests within 36 hours, this is a risk you m
 
 Every penalty action emits an on-chain Escrow event. You can use these events to audit your own history. -->
 
-## 8. Reference implementations
+## 9. Reference implementations
 
 | Language | Location |
 |---|---|
