@@ -2,7 +2,7 @@
 
 This guide tells you how to go from zero to a settled proposal.
 
-All normative facts (field names, amounts, signature formats, penalty amounts) are in [the design document](../design-document) or the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml). This guide links to them and does not repeat them. If this guide and one of those disagree, the source document is correct.
+Use this guide with the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) and the contracts for your deployment. The [design document](../design-document) gives background. Its automatic-sweep model differs from the current TypeScript service contract dependency: your route must transfer output to settlement.
 
 You do not need a CoW solver seat, an allowlist entry, or a relationship with CoW DAO. You need an address, collateral in the Escrow, and the ability to sign EIP-712 messages.
 
@@ -13,7 +13,7 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 - **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
 - **Order selection.** Find orders in CoW's public orderbook. Compute any route that delivers buy tokens to the GPv2Settlement contract. Assume execution from Trampoline with sell tokens on it.
 - **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. The safest and recommended option is enforcing `minBuyAmount = quoteBuyAmount`. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into loose slippage — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
-- **CoW solver rewards.** BYOS does not forward CoW solver rewards to sub-solvers. To earn on a trade, embed a fee inside your route before the sweep — for example, by routing through a pool you operate or by setting your output amount below what the route actually delivers.
+- **Income.** BYOS does not forward CoW solver rewards. Collect your fee inside the route. Output sent to settlement above your commitment does not become your fee.
 <!-- - **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade. -->
 
 **You are NOT responsible for:**
@@ -21,7 +21,7 @@ You do not need a CoW solver seat, an allowlist entry, or a relationship with Co
 - **Transaction submission.** BYOS builds and submits the settlement through the CoW driver. You never call `settle`.
 - **Scoring.** BYOS scores proposals (`surplus - gas`), selects the best one per order, and bids it into CoW's auction.
 - **Gas estimation or fee calculation.** BYOS sizes the gas cut. The driver applies protocol and partner fees. Your amounts are raw, pre-fee route amounts.
-- **Trampoline contract logic.** The sweep, the floor check, and the sandbox isolation are in the contract code. You cannot change them.
+- **Trampoline contract logic.** The contract enforces the floor and isolates your route.
 - **CoW protocol compliance.** BYOS manages the relationship with CoW DAO, the bonding pool, and the reward accounting. But gatekeeping is non-exculpatory. Your signed route is your responsibility.
 
 ## Byos Availability
@@ -83,9 +83,9 @@ A route is a list of raw calls. Each call has a target, a value, and calldata. Y
 
 ### Sandbox constraints
 
-Your Trampoline instance holds only the sell amount that BYOS pushes in for this settlement. The instance has no allowance over `GPv2Settlement`. It has no access to other sub-solver instances. The instance is empty between settlements ([`#topology`](../design-document#topology)).
+BYOS transfers the signed `sellAmount` to your Trampoline before execution. Your calls execute as the Trampoline. Include the token approvals that your route needs, then deliver at least `minBuyAmount` to `GPv2Settlement`. Set the swap receiver to settlement or add an explicit transfer. The contract checks the settlement balance increase; it does not sweep trade tokens.
 
-A route that tries to access protocol buffers gets nothing. A route that plants an approval for future use against a funded contract gets nothing.
+Your instance cannot use settlement funds or other instances. Remaining tokens stay in your instance. Recover them with `claimToken`, and manage any approvals that can spend them.
 
 ### Headroom
 
@@ -95,24 +95,12 @@ Sign **raw, pre-fee route amounts**. Do not pre-subtract fees. The driver create
 
 ### Private market makers
 
-If you are a private market maker (MM) holding your own inventory, the Trampoline is your execution sandbox — not your funds contract. The standard routing pattern (compute a DEX route, let the Trampoline execute it) does not apply; instead, your route transfers buy tokens from your own contract into the settlement.
+Keep inventory in your own funds contract or EOA. Approve only your Trampoline to spend the buy token. Include these calls in your signed route:
 
-**Why not hold inventory in the Trampoline?** The Trampoline receives sell tokens only because BYOS encodes a `sellToken.transfer(trampoline, sellAmount)` interaction in the settlement. If that transfer is omitted — due to a bug or compromise — your route still executes and delivers buy tokens, but you never receive the sell tokens. Routing sub-solvers are not exposed to this: their routes consume sell tokens through DEX swaps, so a missing funding transfer simply reverts the route. An MM transferring from its own inventory has no such natural guard.
+1. `sellToken.transfer(yourFundsAddress, sellAmount)` to receive payment and fail if the input is missing.
+2. `buyToken.transferFrom(yourFundsAddress, GPv2Settlement, minBuyAmount)` to deliver output.
 
-**Recommended pattern:**
-
-1. Deploy your own funds contract (or use an EOA) to hold buy-token inventory.
-2. Grant an ERC-20 approval from your funds contract to your Trampoline instance.
-3. Your signed route includes two interactions:
-   - `buyToken.transferFrom(yourContract, GPv2Settlement, buyAmount)` — delivers output directly to the settlement through the Trampoline.
-   - `sellToken.transfer(yourContract, sellAmount)` — forwards the sell tokens the Trampoline received to your contract, before the sweep.
-4. The Trampoline's sweep sends any remaining balances back to the settlement. The delta check enforces `minBuyAmount` as usual.
-
-Your inventory is safe: the approval is to your Trampoline instance only (isolated per sub-solver), and the route is committed via `interactionsHash` in your EIP-712 signature — BYOS cannot substitute different interactions.
-
-If your route does not explicitly forward sell tokens before the sweep, you can retrieve them post-settlement via `claimToken`.
-
-**Not recommended but not prevented:** you may deposit tokens directly into your Trampoline instance and trust BYOS to always include the funding transfer. BYOS has no incentive to omit it, but the trust assumption is stronger than necessary.
+Recover remaining tokens with `claimToken`. The signature commits to both calls.
 
 ## 6. Sign the proposal
 
