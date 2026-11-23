@@ -705,7 +705,7 @@ Each proposal and solution contains one order from one sub-solver. `/solve` sele
 
 ### Scoring
 
-`score = surplus - gas`, in native-token units.
+`score = surplus - gas`, in native-token units. Gas profitability is mandatory at validation and selection. `USE_GAS_PROFITABILITY=false` is no longer supported.
 
 - **Surplus** is the improvement beyond the order's limit price — extra buy tokens on a sell order, sell tokens kept back on a buy order — converted at the auction's reference price.
 - **Gas** is the simulated gas (`call.gasUsed` from `eth_simulateV1`) plus a 30k buffer, cached on the proposal, times the auction's effective gas price. The buffer is small because the full-settle estimate already covers intrinsic gas and the whole settlement path, so it only absorbs warm and cold storage differences and driver batching variance.
