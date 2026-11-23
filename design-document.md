@@ -473,9 +473,8 @@ stateDiagram-v2
     Submitted --> Lost: outcome worker\n(no driver outcome in window)
     Lost --> Settled: late driver Success
     Lost --> SettleFailed: late driver Revert
-    SettleFailed --> Penalized: Track A escrow debit lands
     Settled --> [*]
-    Penalized --> [*]
+    SettleFailed --> [*]
     Lost --> [*]
 ```
 
@@ -487,12 +486,12 @@ A state answers exactly one question: what does the service do with this proposa
 | `Submitted` | DB (proposals) | no — already sent | no | until terminal |
 | `Rejected` | DB (proposals_log) | no | no | permanent log |
 | `SimFailed` | DB (proposals_log) | no | no | permanent log |
-| `Expired` | DB (proposals_log) | no | no | permanent log |
 | `Cancelled` | DB (proposals_log) | no | no | permanent log |
 | `Lost` | DB (proposals_log) | no | no | permanent log |
 | `Settled` | DB (proposals → proposals_log on delete) | no | no | permanent log |
 | `SettleFailed` | DB (proposals_log) | no | no | permanent log |
-| `Penalized` | DB (proposals_log) | no | no | permanent log |
+
+Penalty payment does not change the proposal status. Record a completed Track A debit in `proposals_log.penalty_tx_hash`.
 
 Every transition:
 
@@ -508,7 +507,6 @@ Every transition:
 | `Submitted` | `Lost` | Outcome worker: no driver outcome observed within the window. Reason is `SolverOutbid` (on-chain Trade event found for the order) or `UnknownOutput` (no trade found). Row deleted. |
 | `Lost` | `Settled` | Late driver `Success` after outcome worker acted. Updates `proposals_log` directly. |
 | `Lost` | `SettleFailed` | Late driver `Revert` after outcome worker acted. Updates `proposals_log` directly. |
-| `SettleFailed` | `Penalized` | Track A escrow debit lands on-chain. Penalty transaction hash recorded in `proposals_log`. |
 
 **Candidates remain in memory until selection.** BYOS allocates an ID before returning acceptance. A restart loses candidates; sub-solvers must resubmit them.
 
@@ -592,7 +590,7 @@ A background job runs every `OUTCOME_WORKER_INTERVAL_SECS` (default 60s). It fin
 - Trade event found → `Lost/SolverOutbid`
 - No trade event → `Lost/UnknownOutput`
 
-The worker marks the row `lost`, inserts a penalty entry, and deletes the live row. A subsequent driver notification takes precedence over this provisional outcome.
+The worker records `lost` in the permanent log and deletes the live row. A late driver outcome can correct this provisional result.
 
 **Attribution:** `/solve` uses the proposal ID as `solutionId`. `/notify` checks `proposals` first, then `proposals_log`. Notification IDs are optional on the wire. An outcome that cannot be matched to a proposal requires an operator alert.
 

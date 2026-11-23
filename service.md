@@ -67,7 +67,7 @@ Processes Track A debits and post-settlement buffer accounting:
 1. For each `SettleFailed` proposal: fetch settlement tx receipt, compute `gas_used × effective_gas_price + frozen c_l`, call `escrow.debit(subSolver, amount, txHash)`.
 2. For each pending non-settlement debit: call `escrow.debit(subSolver, 0.1 × frozen c_l, orderUidHash)`.
 3. **Buffer ledger** — for each `Settled` proposal where `minBuyAmount < quoteBuyAmount` and no ledger entry exists yet: read the `Executed` event's `delta` from the settlement tx receipt, compute the signed gap (`quoteBuyAmount − delta`), convert to native token at the auction's reference price (stored in the `proposals_log` row), and insert a `buffer_entries` row. Positive entries mean under-delivery (debit); negative entries mean over-delivery (credit). Over-delivery credits offset future shortfalls but are never paid out. Then, for each affected sub-solver: sum uncleared entries. If the outstanding balance exceeds `MIN_COLLATERAL / 5`, debit the full balance from escrow in one transaction, mark all entries as cleared, and emit a `bufferDebited` audit event.
-4. On success: transition to `Penalized` (for Track A), record the debit tx hash.
+4. After a Track A debit succeeds, set `proposals_log.penalty_tx_hash`. Keep the proposal status unchanged.
 5. Retry up to 10 times on transient failures, then park for operator investigation.
 
 ## Proposal lifecycle
@@ -88,7 +88,7 @@ Terminal rows leave `proposals` immediately. Reads fall back to `proposals_log`,
 | `proposals_log` | Permanent proposal history, including terminal outcomes and auction prices |
 | `audit_events` | Append-only event history and dispute evidence |
 | `buffer_entries` | Signed delivery gaps; clear net debt above `MIN_COLLATERAL / 5` |
-| `penalties` | Pending non-settlement debits |
+| `debit_operations` | Durable escrow debit queue; `proposals_log.penalty_tx_hash` records completion |
 
 Audit events are written by a background worker after the proposal write commits. A crash between those writes can leave a state change without its audit event.
 
