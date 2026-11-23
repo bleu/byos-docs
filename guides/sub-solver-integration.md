@@ -4,14 +4,14 @@ This guide tells you how to go from zero to a settled proposal.
 
 Use this guide with the [OpenAPI document](https://github.com/bleu/byos-service-ts/blob/main/apps/byos/openapi.yml) and the contracts for your deployment. The [design document](../design-document) gives background. Its automatic-sweep model differs from the current TypeScript service contract dependency: your route must transfer output to settlement.
 
-You do not need a CoW solver seat, an allowlist entry, or a relationship with CoW DAO. You need an address, collateral in the Escrow, and the ability to sign EIP-712 messages.
+You need an address, collateral in the Escrow, and an EIP-712 signer. You do not need a CoW solver seat. Ask the BYOS operator for access if the deployment restricts proposal submission or auction forwarding.
 
 ## Your role as a sub-solver
 
 **You are responsible for:**
 
 - **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
-- **Order selection.** Find orders in CoW's public orderbook. Compute any route that delivers buy tokens to the GPv2Settlement contract. Assume execution from Trampoline with sell tokens on it.
+- **Order selection.** Discover orders through the orderbook or auction forwarding. Build a route that executes from your Trampoline and delivers buy tokens to `GPv2Settlement`.
 - **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. The safest and recommended option is enforcing `minBuyAmount = quoteBuyAmount`. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into loose slippage — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
 - **Income.** BYOS does not forward CoW solver rewards. Collect your fee inside the route. Output sent to settlement above your commitment does not become your fee.
 <!-- - **Responding to Track B claims** within the 36-hour challenge window. Claims can arrive months after a trade. -->
@@ -65,13 +65,16 @@ The new address gets its own Trampoline instance. Your old proposals do not foll
 
 ## 3. Find orders to route
 
-BYOS does not operate an orderbook. Orders come from CoW's orderbook API. Access to the production orderbook may require permission from the CoW team.
+Use one of these discovery methods:
+
+- **Orderbook calls:** poll `GET /api/v1/auction` on the chain's CoW orderbook. Access is easier in staging; production access can require permission from the CoW team.
+- **Auction forwarding:** expose `POST /solve`. Ask the BYOS operator to whitelist your endpoint in `SUBSOLVERS_ENDPOINTS` and agree on `SUBSOLVER_BEARER`. Verify `Authorization: Bearer <token>`. This method is more common in production. Submit signed proposals to BYOS with `POST /proposals`; the `/solve` response is only an acknowledgement.
 
 One proposal covers one order ([`#single-order-solutions`](../design-document#single-order-solutions)). There is no batch format. Both fill-or-kill and partially fillable orders are supported. For partially fillable orders, your proposal's `sellAmount` can be any amount up to the order's remaining fillable amount, and both `minBuyAmount` and `quoteBuyAmount` must independently satisfy the proportionally scaled limit price.
 
 ## 4. Auction timing
 
-Orders appear in CoW's orderbook only after BYOS receives them from the driver in `/solve`. Do not poll the orderbook before a `/solve` call has arrived — the orders will not be there yet.
+Order discovery does not open the BYOS auction. Submit only for orders in BYOS's active auction. For forwarded auctions, finish quoting and submission before `deadline` minus the operator's `SELECTOR_BUFFER_MS` (default 200 ms). Allow time for BYOS to simulate the proposal during submission.
 
 A candidate is valid for one auction window only. Unselected candidates stop competing when the window closes; selected candidates become durable `submitted` proposals and remain available for driver outcomes. New `POST /proposals` requests after the window closes receive `400 NoActiveAuction` until the next auction arrives.
 
