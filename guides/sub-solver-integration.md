@@ -10,7 +10,7 @@ You need an address, collateral in the Escrow, and an EIP-712 signer. You do not
 
 **You are responsible for:**
 
-- **Collateral.** Deposit funds into the Escrow. Your balance must be more than one worst-case Track A debit (`gas + c_l`).
+- **Collateral.** Fund the Escrow to at least the deployment minimum and cover the total exposure of your submitted proposals plus each new proposal.
 - **Order selection.** Discover orders through the orderbook or auction forwarding. Build a route that executes from your Trampoline and delivers buy tokens to `GPv2Settlement`.
 - **Floor and ceiling.** Set `minBuyAmount` and `quoteBuyAmount` in your proposal. The safest and recommended option is enforcing `minBuyAmount = quoteBuyAmount`. `quoteBuyAmount` is the clearing-price commitment — it determines your score and how much the user receives. `minBuyAmount` is the on-chain revert threshold. If the route delivers less than `minBuyAmount`, the settlement reverts (Track A debit). If `quoteBuyAmount` is too low, you lose auctions. For sell orders, you can set `minBuyAmount < quoteBuyAmount` to opt into loose slippage — but the gap between `quoteBuyAmount` and what the route actually delivers is charged against your escrow. For buy orders, `minBuyAmount` must equal `quoteBuyAmount`.
 - **Income.** BYOS does not forward CoW solver rewards. Collect your fee inside the route. Output sent to settlement above your commitment does not become your fee.
@@ -47,11 +47,14 @@ When a settlement that carries your route fails on-chain, BYOS debits the cost f
 
 Deposit native token into the [Escrow](../design-document#escrow) for your address. Any address can fund a sub-solver address. Only the sub-solver address can withdraw.
 
-The deposit causes three effects:
+The deposit deploys your Trampoline at a deterministic address. Resolve it with `TrampolineFactory.addressOf(yourAddress)`. More collateral also increases your API rate limit.
 
-1. **You can submit proposals.** The deposit is the only requirement. The minimum balance must be enough for a single worst-case Track A debit ([`#penalties`](../design-document#penalties)).
-2. **BYOS deploys your [Trampoline](../design-document#topology) instance.** The instance has a deterministic CREATE2 address that is based on your address. You pay this one-time gas cost. All your routes execute in this instance.
-3. **BYOS sets your rate limit.** The rate limit scales with your balance ([`#proposal-api`](../design-document#proposal-api)). A larger deposit gives more throughput.
+Keep enough effective balance for both collateral checks:
+
+1. Hold at least `MIN_COLLATERAL`, the deployment's fixed minimum.
+2. Cover the current proposal plus all your submitted proposals: `sum(c_l + simulatedGas × gasPrice) <= effectiveBalance − max(outstandingBufferBalance, 0)`.
+
+For each proposal, `c_l = min(sellValueNative × COLLATERAL_RATIO_BPS / 10_000, MIN_COLLATERAL)`, rounded down. Positive buffer liabilities reduce available collateral; negative credits cannot cover gas or penalties. Other in-memory candidates are excluded. On `ExposureCapExceeded`, add collateral or wait for submitted proposals to complete. See [collateral gates](../design-document#collateral-gates-and-deployment-penalty-cap).
 
 ### Withdrawal
 
