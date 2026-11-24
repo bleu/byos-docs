@@ -124,7 +124,7 @@ A state answers one question: **what does the service do with this proposal righ
 
 `POST /proposals` uses `(subSolver, nonce)` as its idempotency key. An identical signed replay returns the original id with `202` and has no side effects; different signed content for the same key returns `409 NonceAlreadyUsed`.
 
-When a proposal is still the newest eligible submission and validates, one serialized group transaction activates it and cancels older `Submitted` or `Active` proposals for the same `(subSolver, orderUid)`. It never cancels `Executing` proposals and prevents a late older validator from reactivating stale work.
+Multiple independently signed alternatives for the same `(subSolver, orderUid)` can remain eligible together. BYOS validates each one independently and selects the best eligible score using simulated delivered output and gas. New submissions and out-of-order validation completion do not cancel siblings. To withdraw an eligible alternative, send a signed `DELETE /proposal/{id}` for that specific proposal; siblings remain eligible. Auction-closure and settlement-outcome cleanup still apply, and proposals already sent to the driver cannot be cancelled through the public API.
 
 Transitions are **compare-and-swap** — zero rows affected means the caller's verdict was stale (a cancellation, replacement, or notification won the race).
 

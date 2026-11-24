@@ -180,7 +180,7 @@ Run a loop: quote, sign, submit, poll, resubmit. This loop is the intended opera
 
 ### Cancel a proposal
 
-To cancel a proposal before it settles, send a signed `DELETE` request. Proposals are immutable and there is no update operation. To replace one, submit a new proposal with a new nonce: when it validates, BYOS cancels your older submitted or active proposals for that order. Do not cancel first; the old proposal remains usable until the replacement becomes active.
+To withdraw an eligible candidate, send a signed `DELETE /proposal/{id}` for its specific proposal ID. Proposals are immutable and there is no update operation. You may submit several alternatives for the same order with distinct nonces; BYOS simulates each independently and selects the best eligible score. A new proposal does not cancel older alternatives, even if validation finishes out of order. To refresh routes, submit the new alternatives, then explicitly cancel only the old candidates you want to withdraw. Already submitted driver bids cannot be cancelled through the public API. Each alternative consumes a submission-budget slot.
 
 ## 8. Error handling
 

@@ -431,9 +431,9 @@ struct CancelProposal {
 }
 ```
 
-Proposals are immutable, so there is no update operation and no `PUT`. Replacement is always a new `POST`; it is not preceded by a `DELETE`. Once the newer proposal validates, it cancels the caller's older `Submitted` and `Active` proposals for the same order.
+Proposals are immutable, so there is no update operation and no `PUT`. A sub-solver may submit multiple independently signed alternatives for the same order, each with its own nonce. A new `POST` never implicitly cancels older proposals. To withdraw a specific eligible proposal, its owner sends a signed `DELETE /proposal/{id}`; sibling proposals for that order remain eligible.
 
-**Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `202 Accepted` and creates no row, audit event, or replacement. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, so there is no unsigned replacement-intent field.
+**Nonce uniqueness is global per sub-solver.** The recovered signer and nonce form the unique key: `(subSolver, nonce)`. A byte-for-byte equivalent signed proposal is idempotent: BYOS returns its original proposal id with `202 Accepted` and creates no row or audit event. Reusing that nonce with any different signed content returns `409 NonceAlreadyUsed`. The signature already identifies the sub-solver, and each alternative is signed independently.
 
 **Ingestion is synchronous.** The request path validates proposals inline: parse, verify the signature, check the expiry window, then run the escrow check and settlement simulation. For EOA sub-solvers, signature verification is a pure `ecrecover` — no RPC. For contract sub-solvers (`subSolverAddress` present), the service tries `ecrecover` first; if that does not match, it calls `isValidSignature` on-chain. A `200` response means the proposal passed all checks and is `Active` in the current auction. A `400 ProposalRejected` means it failed; the `reason` field carries the typed rejection reason. A `202` means the proposal was stored as `Submitted` but no active auction is running — the sub-solver should resubmit when the next auction opens.
 
@@ -508,7 +508,7 @@ Every transition:
 | `Submitted` | `Rejected` | `POST /proposals`: a gatekeeping rule fails — insufficient escrow, unsupported order, amount mismatch, order not found, or unprofitable. Carries the typed reason. Also on `AuctionClosed` when the auction window closes. |
 | `Submitted` | `SimFailed` | `POST /proposals`: simulation reverts. Terminal on first occurrence. |
 | `Submitted`, `Active` | `Expired` | `validUntil` is behind the clock. |
-| `Submitted`, `Active` | `Cancelled` | Signed `DELETE` by the owner, or a newer proposal for the same `(subSolver, orderUid)` validates and activates. `DELETE` against any other state is a 409. Also on `AuctionClosed` for proposals that were not selected in the solution. |
+| `Submitted`, `Active` | `Cancelled` | Signed `DELETE` by the owner identifying the specific proposal. A new proposal for the same order does not cancel siblings. `DELETE` against any other state is a 409. Also on `AuctionClosed` for proposals that were not selected in the solution. |
 | `Active` | `Executing` | Driver `SettlementStarted`: our solution won and the transaction is being submitted. |
 | `Executing` | `Settled` | Driver `Success`. Transaction hash recorded. |
 | `Executing` | `SettleFailed` | Driver `Revert`. Transaction hash recorded; the Track A debit follows. |
@@ -517,13 +517,13 @@ Every transition:
 
 **Competitive losses are terminal states.** When BYOS picks a winning sub-solver for an order at `/solve` time, all active proposals for that order from *other* sub-solvers are immediately marked `Rejected: SubsolverOutbid`. Proposals from the same sub-solver as the winner are left untouched — BYOS may fall back to a same-solver runner-up within one auction cycle if the best proposal's fee cut breaches the signed limit. When the winning BYOS solution loses the on-chain auction to an external solver, the subsequent simulation revert with reason `"GPv2: order filled"` is translated to `Rejected: SolverOutbid`. Both transitions are recorded in the audit log and exposed through the standard `GET /proposal/{id}` response so sub-solvers can distinguish competitive losses from genuine route failures.
 
-**Replacement is an activation-time, atomic group transition.** A successfully validated proposal becomes `Active` only if it is still the newest eligible submission for its `(subSolver, orderUid)` group. In that same serialized transaction, it changes every older `Submitted` or `Active` proposal in the group to `Cancelled`; `Executing` proposals are unchanged. This ordering prevents a late incoming POST from reactivating a stale proposal.
+**Alternatives are validated independently.** Several proposals for the same `(subSolver, orderUid)` may remain eligible together. A failed simulation, a later submission, or an out-of-order validation completion never cancels successful siblings. BYOS compares the eligible alternatives using simulated delivered output and gas and sends only the best eligible proposal per order to the driver. Owner-initiated cancellation is explicit per proposal ID; auction-closure and settlement-outcome cleanup still apply. Each alternative consumes the normal submission and simulation budget.
 
 `Executing` is entered on `SettlementStarted`, not at `/solve` time, because at `/solve` time we do not yet know we won. It is exempt from the expiry sweep on purpose — the chain enforces the order's real deadline. An abandoned execution returns to `Active`, covering lost notifications and restarts mid-settlement. Success and revert remain terminal.
 
 **Selected proposals survive auction closure.** When `/solve` returns, the auction window closes and all unselected `Submitted` or `Active` proposals for that auction are cancelled with reason `AuctionClosed`. Proposals that were included in the solution are explicitly excluded from this sweep — they remain `Active` so that the driver's subsequent settlement notifications (`SettlementStarted`, `Success`, `Revert`) can still advance them through the settlement states.
 
-Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a cancellation, replacement, or notification won the race.
+Transitions are compare-and-swap. Zero rows affected means the caller's verdict was stale, because a cancellation or notification won the race.
 
 **Terminal retention has one knob.** Rejected, sim-failed, expired, and cancelled rows are swept from the active store an hour after reaching the state; consumers observe the terminal state within one polling interval before that happens. The money states — settled, settle-failed, penalized — are never swept. `audit_events` has no deletion path. All proposals, regardless of status, are mirrored to a permanent `proposals_log` table kept in sync by a database trigger; `GET /proposal/{id}` falls back to that log automatically, so a swept proposal is never a 404.
 
